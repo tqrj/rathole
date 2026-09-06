@@ -1,0 +1,6 @@
+# Exposes nothing; only receives the directory and opens alias listeners on [::1]
+[client]
+remote_addr = "127.0.0.1:2331"
+user = "bob"
+key = "bob_key"
+alias_bind = "::1"

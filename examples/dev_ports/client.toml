@@ -1,0 +1,5 @@
+# 客户端：只需认证，暴露哪些端口由服务端决定
+[client]
+remote_addr = "myserver.com:2333"
+user = "dev"
+key = "dev_secret"

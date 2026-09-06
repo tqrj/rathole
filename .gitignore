@@ -1,3 +1,7 @@
 /target
 perf.data
 perf.data.old
+allocations.toml
+/dist
+.DS_Store
+/.idea

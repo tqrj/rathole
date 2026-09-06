@@ -3,5 +3,5 @@ remote_addr = "example.com:2333"
 user = "alice"
 key = "k"
 
-[client.transport]
-type = "tls"
+[client.expose]
+tcp = ["80"]

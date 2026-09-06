@@ -21,6 +21,9 @@ const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
 const HITTER_NUM: usize = 4;
 
+const ALIAS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8082";
+const ALIAS_ADDR: &str = "[::1]:2336"; // bob's alias of alice's 8082
+
 #[derive(Clone, Copy, Debug)]
 enum Type {
     Tcp,
@@ -39,6 +42,7 @@ fn init() {
 #[tokio::test]
 async fn tcp() -> Result<()> {
     init();
+    let _ = std::fs::remove_file("target/alloc_tcp.toml");
 
     // Spawn a echo server
     tokio::spawn(async move {
@@ -80,6 +84,7 @@ async fn tcp() -> Result<()> {
 #[tokio::test]
 async fn udp() -> Result<()> {
     init();
+    let _ = std::fs::remove_file("target/alloc_udp.toml");
 
     // Spawn a echo server
     tokio::spawn(async move {
@@ -115,6 +120,77 @@ async fn udp() -> Result<()> {
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
+    Ok(())
+}
+
+// bob opens an alias `[::1]:2336` for alice's exposed port while alice is online
+#[tokio::test]
+async fn alias() -> Result<()> {
+    init();
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file("target/alloc_alias.toml");
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(ALIAS_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let (alice_shutdown_tx, alice_shutdown_rx) = broadcast::channel(1);
+    let (bob_shutdown_tx, bob_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_rathole_server("tests/for_alias/server.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let bob = tokio::spawn(async move {
+        run_rathole_client("tests/for_alias/bob.toml", bob_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(500)).await;
+
+    // alice offline: no alias yet
+    assert!(TcpStream::connect(ALIAS_ADDR).await.is_err());
+
+    info!("start alice");
+    let alice = tokio::spawn(async move {
+        run_rathole_client("tests/for_alias/alice.toml", alice_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await;
+    info!("echo via alias");
+    tcp_echo_hitter(ALIAS_ADDR).await?;
+
+    info!("shutdown alice");
+    alice_shutdown_tx.send(true)?;
+    let _ = tokio::join!(alice);
+    time::sleep(Duration::from_secs(1)).await;
+    assert!(TcpStream::connect(ALIAS_ADDR).await.is_err());
+
+    info!("restart alice");
+    let alice_shutdown_rx = alice_shutdown_tx.subscribe();
+    let alice = tokio::spawn(async move {
+        run_rathole_client("tests/for_alias/alice.toml", alice_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await;
+    tcp_echo_hitter(ALIAS_ADDR).await?;
+
+    // Allocation is stable across reconnects
+    let alloc = std::fs::read_to_string("target/alloc_alias.toml")?;
+    assert!(alloc.contains("remote_port = 2336"));
+
+    server_shutdown_tx.send(true)?;
+    alice_shutdown_tx.send(true)?;
+    bob_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, alice, bob);
     Ok(())
 }
 

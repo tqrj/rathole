@@ -2,26 +2,25 @@
 
 ![rathole-logo](./docs/img/rathole-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
-
 [English](README.md) | [简体中文](README-zh.md)
 
-安全、稳定、高性能的内网穿透工具，用 Rust 语言编写
+安全、稳定、高性能的内网穿透工具，用 Rust 语言编写。
 
-rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://github.com/inconshreveable/ngrok)，可以让 NAT 后的设备上的服务通过具有公网 IP 的服务器暴露在公网上。
+本仓库是 [rathole](https://github.com/rapiz1/rathole) 的二次开发版本：把原来“每个服务一个 token”的模型改成了**用户模型**。服务端在 `server.toml` 里定义用户、密钥、独占的远端端口块以及要暴露的本地端口；客户端只需要 `服务器地址 + 用户名 + 密钥`，暴露什么一切以服务端为准，远端端口由服务端在该用户的端口块内自动、稳定地分配。所有客户端都能看到全网映射目录，并在本机自动开出别名端口访问其他人的服务。
 
 <!-- TOC -->
 
 - [rathole](#rathole)
   - [Features](#features)
   - [Quickstart](#quickstart)
+  - [映射目录与别名](#映射目录与别名)
   - [Configuration](#configuration)
+    - [server.users](#serverusers)
+    - [端口分配规则](#端口分配规则)
+    - [热重载](#热重载)
     - [Logging](#logging)
     - [Tuning](#tuning)
+  - [Build](#build)
   - [Benchmark](#benchmark)
   - [Development Status](#development-status)
 
@@ -29,36 +28,33 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Features
 
-- **高性能** 具有更高的吞吐量，高并发下更稳定。见[Benchmark](#benchmark)
-- **低资源消耗** 内存占用远低于同类工具。见[Benchmark](#benchmark)。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
-- **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
-- **热重载** 支持配置文件热重载，动态修改端口转发服务。HTTP API 正在开发中。
+- **高性能** 具有更高的吞吐量，高并发下更稳定。见 [Benchmark](#benchmark)
+- **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
+- **用户级认证** 服务端 `[server.users]` 定义用户、密钥、独占的远端端口块和要暴露的本地端口；客户端只需 `remote_addr + user + key`。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
+- **稳定端口分配** 服务端用 `tcp = ["3000", "8000-8010"]` 指定该用户要暴露的本地端口，在端口块内分配远端端口并持久化到 `allocations.toml`，重启、重连后映射不变。
+- **映射目录与别名** 认证后服务端下发全网映射目录（谁的哪个本地端口映射到哪个远端端口、是否在线）。客户端打印表格，并在本机 `127.0.0.1:<远端端口>` 开出别名监听转发到服务器；对端下线即关闭。
+- **热重载** 配置文件修改后自动重启实例，客户端自动重连。
 
 ## Quickstart
 
-一个全功能的 `rathole` 可以从 [release](https://github.com/rapiz1/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
+假设你有一台公网服务器 `myserver.com`，家里 NAT 后面有一台 NAS，想把它的 ssh 暴露出去。
 
-`rathole` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
+1. 在公网服务器上
 
-使用 rathole 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些服务需要暴露在互联网上。
-
-假设你在家里的 NAT 后面有一个 NAS，并且想把它的 ssh 服务暴露在公网上：
-
-1. 在有一个公网 IP 的服务器上
-
-创建 `server.toml`，内容如下，并根据你的需要调整。
+创建 `server.toml`：
 
 ```toml
 # server.toml
 [server]
-bind_addr = "0.0.0.0:2333" # `2333` 配置了服务端监听客户端连接的端口
+bind_addr = "0.0.0.0:2333" # 服务端监听客户端连接的端口
 
-[server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 用于验证的 token
-bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网的端口
+[server.users.alice]
+key = "use_a_secret_that_only_you_know" # 客户端认证密钥
+port_block = "20000-20999"              # alice 独占的远端端口块，各用户不能重叠
+tcp = ["22"]                            # 要暴露的 alice 本机端口，支持 "端口" 或 "起-止" 范围
 ```
 
-然后运行:
+然后运行：
 
 ```bash
 ./rathole server.toml
@@ -66,16 +62,17 @@ bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网
 
 2. 在 NAT 后面的主机（你的 NAS）上
 
-创建 `client.toml`，内容如下，并根据你的需要进行调整。
+创建 `client.toml`：
 
 ```toml
 # client.toml
 [client]
-remote_addr = "myserver.com:2333" # 服务器的地址。端口必须与 `server.bind_addr` 中的端口相同。
-[client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 必须与服务器相同以通过验证
-local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
+remote_addr = "myserver.com:2333" # 服务器地址，端口必须与 `server.bind_addr` 一致
+user = "alice"
+key = "use_a_secret_that_only_you_know"
 ```
+
+客户端不用声明任何端口，暴露哪些端口以服务端配置为准。
 
 然后运行：
 
@@ -83,19 +80,48 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 ./rathole client.toml
 ```
 
-3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333`的 `rathole` 服务器，任何到 `myserver.com:5202` 的流量将被转发到客户端所在主机的 `22` 端口。
+3. 客户端连上服务器后会打印映射表，例如：
 
-所以你可以 `ssh myserver.com:5202` 来 ssh 到你的 NAS。
+```
+USER         PROTO  LOCAL  REMOTE STATUS   ALIAS
+alice        tcp       22   20000 online   -
+```
 
-[Systemd examples](./examples/systemd) 中提供了一些让 `rathole` 在 Linux 上作为后台服务运行的配置示例。
+任何到 `myserver.com:20000` 的流量都会被转发到 NAS 的 `22` 端口，所以你可以 `ssh -p 20000 myserver.com` 登录 NAS。分配结果会写进服务端的 `allocations.toml`，下次 `22` 仍然映射到 `20000`。
+
+更多示例见 [examples](./examples)：
+
+| 目录 | 说明 |
+|---|---|
+| `examples/minimal` | 最小配置，含一个只看目录、用别名的 `client_bob.toml` |
+| `examples/dev_ports` | 客户端开放 `5173-5200`，服务端原样映射到 `5173-5200` |
+| `examples/udp` | 暴露 UDP 端口（`udp = [...]`） |
+| `examples/tls` / `examples/noise_nk` | TLS / Noise 加密传输 |
+| `examples/use_proxy` | 客户端经 socks5/http 代理连接服务器 |
+| `examples/systemd` | Linux 上作为后台服务运行 |
+
+## 映射目录与别名
+
+每个客户端认证后都会收到全网映射目录，并在目录变化（有人上线、下线）时收到推送。客户端把目录打印成表格，同时为**其他用户**的每个在线 TCP 映射在本机开一个别名监听 `<alias_bind>:<远端端口>`（默认 `127.0.0.1`），把连接转发到 `服务器:<远端端口>`。
+
+也就是说，bob 的机器上执行 `ssh -p 20000 127.0.0.1` 就能登录 alice 的 NAS，不需要记服务器地址。alice 下线时，bob 的表格立刻变成 `offline`，别名端口随之关闭。
+
+```
+USER         PROTO  LOCAL  REMOTE STATUS   ALIAS
+alice        tcp       22   20000 online   127.0.0.1:20000
+alice        tcp     8080   20001 offline  -
+bob          tcp     3000   21000 online   -
+```
+
+注意：
+
+- 别名只对 TCP 生效，UDP 映射不开别名。
+- 自己的映射不开别名（走服务器回环没有意义）。
+- 别名端口号与远端端口号相同，若客户端与服务端跑在同一台机器上会端口冲突，此时可以把 `alias_bind` 改成 `::1` 或其他本机地址。
 
 ## Configuration
 
-如果只有一个 `[server]` 和 `[client]` 块存在的话，`rathole` 可以根据配置文件的内容自动决定在服务器模式或客户端模式下运行，就像 [Quickstart](#quickstart) 中的例子。
-
-但 `[client]` 和 `[server]` 块也可以放在一个文件中。然后在服务器端，运行 `rathole --server config.toml`。在客户端，运行 `rathole --client config.toml` 来明确告诉 `rathole` 运行模式。
-
-**推荐首先查看 [examples](./examples) 中的配置示例来快速理解配置格式**，如果有不清楚的地方再查阅完整配置格式。
+如果只有一个 `[server]` 或 `[client]` 块存在，`rathole` 会根据配置文件自动决定运行模式。两个块也可以放在一个文件里，然后用 `rathole --server config.toml` / `rathole --client config.toml` 显式指定。
 
 关于如何配置 Noise Protocol 和 TLS 来进行加密传输，参见 [Transport](./docs/transport.md)。
 
@@ -103,84 +129,100 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+remote_addr = "example.com:2333" # 必填。服务器地址
+user = "alice"                   # 必填。必须存在于服务端的 [server.users]
+key = "alice_secret"             # 必填。用户密钥
+alias_bind = "127.0.0.1"         # 可选。别名监听的本机地址。默认 "127.0.0.1"
+prefer_ipv6 = false              # 可选。本地 UDP 套接字优先使用 IPv6。默认 false
+nodelay = true                   # 可选。数据通道的 TCP_NODELAY。默认不修改
+heartbeat_timeout = 40           # 可选。0 关闭应用层心跳检测，必须大于 server.heartbeat_interval。默认 40 秒
+retry_interval = 1               # 可选。重连服务器的最大间隔。默认 1 秒
 
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
+[client.transport] # 整块可选。指定传输层
+type = "tcp" # 可选。可选值：["tcp", "tls", "noise", "websocket"]。默认 "tcp"
 
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
+[client.transport.tcp] # 可选。同样影响 noise 和 tls
+proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。连接服务器使用的代理，支持 http 和 socks5
+nodelay = true          # 可选。控制通道的 TCP_NODELAY。默认 true
+keepalive_secs = 20     # 可选。tcp(7) 的 tcp_keepalive_time。默认 20 秒
+keepalive_interval = 8  # 可选。tcp(7) 的 tcp_keepalive_intvl。默认 8 秒
 
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
+[client.transport.tls] # type 为 "tls" 时必填
+trusted_root = "ca.pem"  # 必填。签发服务器证书的 CA 证书
+hostname = "example.com" # 可选。校验证书用的主机名，缺省回退到 client.remote_addr
 
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
+[client.transport.noise] # Noise 协议，见 docs/transport.md
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认如上
+local_private_key = "key_encoded_in_base64"   # 可选
+remote_public_key = "key_encoded_in_base64"   # 可选
 
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
+[client.transport.websocket] # type 为 "websocket" 时必填
+tls = true # 为 true 时使用 client.transport.tls 的设置
 
 [server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+bind_addr = "0.0.0.0:2333"      # 必填。监听客户端连接的地址。分配出去的远端端口也绑定在同一个地址上
+alloc_file = "allocations.toml" # 可选。远端端口分配表，相对本文件。默认 "allocations.toml"
+nodelay = true                  # 可选。数据通道的 TCP_NODELAY。默认不修改
+heartbeat_interval = 30         # 可选。应用层心跳间隔，0 关闭。默认 30 秒
 
-[server.transport] # Same as `[client.transport]`
+[server.users.alice] # 每个用户一个表，表名即客户端的 user
+key = "alice_secret"        # 必填。客户端用它认证
+port_block = "20000-20999"  # 必填。远端端口块，"端口" 或 "起-止"。各用户的端口块不能重叠
+tcp = ["22", "8000-8010"]   # 可选。要暴露的客户端本地 TCP 端口，每项为 "端口" 或 "起-止"。客户端连接到 127.0.0.1:<端口>
+udp = ["5353"]              # 可选。同上，UDP
+
+[server.transport] # 同 [client.transport]
 type = "tcp"
 
-[server.transport.tcp] # Same as the client
+[server.transport.tcp] # 同客户端
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
+[server.transport.tls] # type 为 "tls" 时必填
+pkcs12 = "identify.pfx"     # 必填。服务器证书和私钥的 pkcs12 文件
+pkcs12_password = "password" # 必填。pkcs12 文件密码
 
-[server.transport.noise] # Same as `[client.transport.noise]`
+[server.transport.noise] # 同 [client.transport.noise]
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
 
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
-
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
-
-[server.services.service2]
-bind_addr = "0.0.0.1:8082"
+[server.transport.websocket] # type 为 "websocket" 时必填
+tls = true
 ```
+
+### server.users
+
+```toml
+[server.users.alice]
+key = "alice_secret"       # 必填。客户端用它认证
+port_block = "20000-20999" # 必填。远端端口块，"端口" 或 "起-止"。各用户的端口块不能重叠
+tcp = ["22"]               # 可选。要暴露的 alice 本机 TCP 端口
+udp = []                   # 可选。UDP 同理
+
+[server.users.bob]         # 不暴露任何端口，只看目录、用别名
+key = "bob_secret"
+port_block = "21000-21999"
+```
+
+暴露的端口数不能超过端口块大小，否则配置校验失败。
+
+### 端口分配规则
+
+- 分配键是 `(用户, 协议, 本地端口)`，值是远端端口，全部保存在 `alloc_file` 里。
+- 客户端认证后，服务端按该用户配置的本地端口升序处理：已有分配且仍在端口块内就沿用；否则取端口块内该用户最小的空闲端口。
+- TCP 和 UDP 共用同一个端口块的号段，避免同一个号码同时给两个协议。
+- 端口块用完时服务端拒绝注册，客户端会打印错误并按 `retry_interval` 重试（正常情况下配置校验已经拦住了这种情况）。
+- 端口块与暴露范围完全一致时（如 `examples/dev_ports`），结果就是原样映射。
+
+### 热重载
+
+- 修改 `server.toml` / `client.toml` 会整体重启实例；服务端重启后所有客户端自动重连重注册，端口分配从 `alloc_file` 恢复，映射不变。
 
 ### Logging
 
-`rathole`，像许多其他 Rust 程序一样，使用环境变量来控制日志级别。
-
-支持的 Logging Level 有 `info`, `warn`, `error`, `debug`, `trace`
-
-比如将日志级别设置为 `error`:
+`rathole` 使用环境变量控制日志级别，支持 `info`, `warn`, `error`, `debug`, `trace`：
 
 ```shell
 RUST_LOG=error ./rathole config.toml
@@ -190,17 +232,22 @@ RUST_LOG=error ./rathole config.toml
 
 ### Tuning
 
-从 v0.4.7 开始, rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP，Minecraft 服务器。但它会减少一些带宽。
+rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP、Minecraft 服务器，但会减少一些带宽。如果带宽更重要，可以通过 `nodelay = false` 关闭。
 
-如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
+## Build
+
+```sh
+cargo build --release                                   # 本机
+cargo build --release --target x86_64-apple-darwin      # macOS x86_64（在 Apple Silicon 上）
+cross build --release --target x86_64-unknown-linux-musl # Linux，需要 docker 和 cargo install cross
+cross build --release --target x86_64-pc-windows-gnu     # Windows
+```
+
+更多平台与最小化二进制见 [build-guide](docs/build-guide.md)。
 
 ## Benchmark
 
-rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并发情况下表现更好，能提供更大的带宽，内存占用更少。
-
-关于测试进行的更多细节，参见单独页面 [Benchmark](./docs/benchmark.md)。
-
-**但是，不要从这里得出结论，`rathole` 能让内网转发出来的服务快上数倍。** Benchmark 是在本地回环上进行的，其结果说明了任务受 CPU 限制时的结果。当用户的网络不是瓶颈时，用户能得到很大的提升。但是，对很多用户来说并不是这样。在这种情况下，`rathole` 能带来的主要好处是更少的资源占用，而带宽和延迟不一定有显著的改善。
+rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并发情况下表现更好，能提供更大的带宽，内存占用更少。细节见 [Benchmark](./docs/benchmark.md)。
 
 ![http_throughput](./docs/img/http_throughput.svg)
 ![tcp_bitrate](./docs/img/tcp_bitrate.svg)
@@ -209,11 +256,10 @@ rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并�
 
 ## Development Status
 
-`rathole` 正在积极开发中
-
-- [x] 支持 TLS
-- [x] 支持 UDP
-- [x] 热重载
-- [ ] 用于配置的 HTTP APIs
-
-[Out of Scope](./docs/out-of-scope.md) 列举了没有计划开发的特性并说明了原因。
+- [x] 用户级认证与端口块
+- [x] 稳定端口分配（持久化）
+- [x] 映射目录推送与本机别名
+- [x] 配置热重载
+- [x] TLS / Noise / WebSocket 传输
+- [x] UDP
+- [ ] TUN、Web 管理界面、多租户（不在计划内）

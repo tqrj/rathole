@@ -5,6 +5,8 @@ mod constants;
 mod helper;
 mod multi_map;
 mod protocol;
+#[cfg(feature = "server")]
+mod registry;
 mod transport;
 
 pub use cli::Cli;
@@ -13,7 +15,7 @@ pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{debug, info};
 
 #[cfg(feature = "client")]
@@ -26,7 +28,7 @@ mod server;
 #[cfg(feature = "server")]
 use server::run_server;
 
-use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
+use crate::config_watcher::ConfigWatcherHandle;
 
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
@@ -74,39 +76,23 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    // (The join handle of the last instance, The service update channel sender)
-    let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
+    // The join handle of the last instance
+    let mut last_instance: Option<tokio::task::JoinHandle<_>> = None;
 
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
-        match e {
-            ConfigChange::General(config) => {
-                if let Some((i, _)) = last_instance {
-                    info!("General configuration change detected. Restarting...");
-                    shutdown_tx.send(true)?;
-                    i.await??;
-                }
-
-                debug!("{:?}", config);
-
-                let (service_update_tx, service_update_rx) = mpsc::channel(1024);
-
-                last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        args.clone(),
-                        shutdown_tx.subscribe(),
-                        service_update_rx,
-                    )),
-                    service_update_tx,
-                ));
-            }
-            ev => {
-                info!("Service change detected. {:?}", ev);
-                if let Some((_, service_update_tx)) = &last_instance {
-                    let _ = service_update_tx.send(ev).await;
-                }
-            }
+    while let Some(config) = cfg_watcher.event_rx.recv().await {
+        if let Some(i) = last_instance {
+            info!("Configuration change detected. Restarting...");
+            shutdown_tx.send(true)?;
+            i.await??;
         }
+
+        debug!("{:?}", config);
+
+        last_instance = Some(tokio::spawn(run_instance(
+            config,
+            args.clone(),
+            shutdown_tx.subscribe(),
+        )));
     }
 
     let _ = shutdown_tx.send(true);
@@ -118,7 +104,6 @@ async fn run_instance(
     config: Config,
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
-    service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -126,13 +111,13 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, shutdown_rx).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update).await
+            run_server(config, shutdown_rx).await
         }
     }
 }

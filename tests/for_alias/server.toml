@@ -1,0 +1,12 @@
+[server]
+bind_addr = "127.0.0.1:2331"
+alloc_file = "../../target/alloc_alias.toml"
+
+[server.users.alice]
+key = "alice_key"
+port_block = "2336"
+tcp = ["8082"]
+
+[server.users.bob] # exposes nothing; only receives the directory
+key = "bob_key"
+port_block = "2337"

@@ -1,33 +1,29 @@
 [client]
-remote_addr = "127.0.0.1:2333" 
-default_token = "default_token_if_not_specify" 
+user = "test"
+key = "test_key"
+remote_addr = "127.0.0.1:2333"
 
 [client.transport]
-type = "websocket" 
+type = "websocket"
 [client.transport.tls]
 trusted_root = "examples/tls/rootCA.crt"
 hostname = "localhost"
-[client.transport.websocket] 
+[client.transport.websocket]
 tls = true
 
-[client.services.echo] 
-local_addr = "127.0.0.1:8080" 
-[client.services.pingpong] 
-local_addr = "127.0.0.1:8081" 
-
 [server]
-bind_addr = "0.0.0.0:2333" 
-default_token = "default_token_if_not_specify" 
+alloc_file = "../../target/alloc_tcp.toml"
+bind_addr = "0.0.0.0:2333"
 
 [server.transport]
-type = "websocket" 
+type = "websocket"
 [server.transport.tls]
 pkcs12 = "examples/tls/identity.pfx"
 pkcs12_password = "1234"
-[server.transport.websocket] 
+[server.transport.websocket]
 tls = true
 
-[server.services.echo] 
-bind_addr = "0.0.0.0:2334" 
-[server.services.pingpong] 
-bind_addr = "0.0.0.0:2335" 
+[server.users.test]
+key = "test_key"
+port_block = "2334-2335"
+tcp = ["8080", "8081"]

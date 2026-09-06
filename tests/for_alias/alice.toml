@@ -1,0 +1,5 @@
+# Exposes 8082 (configured on the server) and receives the directory
+[client]
+remote_addr = "127.0.0.1:2331"
+user = "alice"
+key = "alice_key"

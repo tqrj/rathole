@@ -1,0 +1,7 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+
+[server.users.alice]
+key = "k"
+port_block = "20000-20009"
+tcp = ["9-1"]

@@ -1,0 +1,7 @@
+# Exposes nothing. Receives the directory and opens 127.0.0.1:<remote_port>
+# aliases for every online mapping of other users.
+[client]
+remote_addr = "localhost:2333"
+user = "bob"
+key = "bob_secret"
+alias_bind = "127.0.0.1" # Optional. Default: "127.0.0.1"

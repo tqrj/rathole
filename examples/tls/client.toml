@@ -1,12 +1,10 @@
 [client]
 remote_addr = "127.0.0.1:2333"
-default_token = "123"
+user = "alice"
+key = "alice_secret"
 
 [client.transport]
 type = "tls"
 [client.transport.tls]
 trusted_root = "examples/tls/rootCA.crt"
 hostname = "localhost"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"

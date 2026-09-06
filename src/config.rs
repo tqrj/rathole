@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::ops::Deref;
-use std::path::Path;
+use std::ops::{Deref, RangeInclusive};
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use url::Url;
 
@@ -53,33 +53,7 @@ pub enum TransportType {
     Websocket,
 }
 
-/// Per service config
-/// All Option are optional in configuration but must be Some value in runtime
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ClientServiceConfig {
-    #[serde(rename = "type", default = "default_service_type")]
-    pub service_type: ServiceType,
-    #[serde(skip)]
-    pub name: String,
-    pub local_addr: String,
-    #[serde(default)] // Default to false
-    pub prefer_ipv6: bool,
-    pub token: Option<MaskedString>,
-    pub nodelay: Option<bool>,
-    pub retry_interval: Option<u64>,
-}
-
-impl ClientServiceConfig {
-    pub fn with_name(name: &str) -> ClientServiceConfig {
-        ClientServiceConfig {
-            name: name.to_string(),
-            ..Default::default()
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum ServiceType {
     #[serde(rename = "tcp")]
     #[default]
@@ -88,32 +62,45 @@ pub enum ServiceType {
     Udp,
 }
 
-fn default_service_type() -> ServiceType {
-    Default::default()
-}
-
-/// Per service config
-/// All Option are optional in configuration but must be Some value in runtime
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ServerServiceConfig {
-    #[serde(rename = "type", default = "default_service_type")]
-    pub service_type: ServiceType,
-    #[serde(skip)]
-    pub name: String,
-    pub bind_addr: String,
-    pub token: Option<MaskedString>,
-    pub nodelay: Option<bool>,
-}
-
-impl ServerServiceConfig {
-    pub fn with_name(name: &str) -> ServerServiceConfig {
-        ServerServiceConfig {
-            name: name.to_string(),
-            ..Default::default()
-        }
+impl std::fmt::Display for ServiceType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ServiceType::Tcp => "tcp",
+            ServiceType::Udp => "udp",
+        })
     }
 }
+
+/// Parse "3000" or "8000-8010" into an inclusive port range
+pub fn parse_port_range(s: &str) -> Result<RangeInclusive<u16>> {
+    let s = s.trim();
+    let (lo, hi) = match s.split_once('-') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (s, s),
+    };
+    let lo: u16 = lo
+        .parse()
+        .with_context(|| format!("Invalid port `{}`", lo))?;
+    let hi: u16 = hi
+        .parse()
+        .with_context(|| format!("Invalid port `{}`", hi))?;
+    if lo == 0 || lo > hi {
+        bail!("Invalid port range `{}`", s);
+    }
+    Ok(lo..=hi)
+}
+
+/// Expand a list of port specs into a sorted, deduplicated port list
+fn expand_ports(specs: &[String]) -> Result<Vec<u16>> {
+    let mut v: Vec<u16> = Vec::new();
+    for s in specs {
+        v.extend(parse_port_range(s)?);
+    }
+    v.sort_unstable();
+    v.dedup();
+    Ok(v)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
@@ -198,13 +185,22 @@ fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+fn default_alias_bind() -> String {
+    String::from("127.0.0.1")
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub remote_addr: String,
-    pub default_token: Option<MaskedString>,
-    pub prefer_ipv6: Option<bool>,
-    pub services: HashMap<String, ClientServiceConfig>,
+    pub user: String,
+    pub key: MaskedString,
+    /// Host on which alias listeners (`<alias_bind>:<remote_port>`) are opened
+    #[serde(default = "default_alias_bind")]
+    pub alias_bind: String,
+    #[serde(default)]
+    pub prefer_ipv6: bool,
+    pub nodelay: Option<bool>,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_timeout")]
@@ -213,20 +209,107 @@ pub struct ClientConfig {
     pub retry_interval: u64,
 }
 
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            remote_addr: Default::default(),
+            user: Default::default(),
+            key: Default::default(),
+            alias_bind: default_alias_bind(),
+            prefer_ipv6: false,
+            nodelay: None,
+            transport: Default::default(),
+            heartbeat_timeout: default_heartbeat_timeout(),
+            retry_interval: default_client_retry_interval(),
+        }
+    }
+}
+
 fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+fn default_alloc_file() -> PathBuf {
+    PathBuf::from("allocations.toml")
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub default_token: Option<MaskedString>,
-    pub services: HashMap<String, ServerServiceConfig>,
+    /// `[server.users.<name>]`
+    #[serde(default)]
+    pub users: HashMap<String, UserConfig>,
+    /// Path of the persisted port allocation table, relative to the config file
+    #[serde(default = "default_alloc_file")]
+    pub alloc_file: PathBuf,
+    pub nodelay: Option<bool>,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: Default::default(),
+            users: Default::default(),
+            alloc_file: default_alloc_file(),
+            nodelay: None,
+            transport: Default::default(),
+            heartbeat_interval: default_heartbeat_interval(),
+        }
+    }
+}
+
+/// `[server.users.<name>]`: a user, its exclusive remote port block and the
+/// local ports of its client that get exposed
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    #[serde(skip)]
+    pub name: String,
+    pub key: MaskedString,
+    /// e.g. "20000-20999"
+    pub port_block: String,
+    /// Local TCP ports of the client, e.g. `["3000", "8000-8010"]`
+    #[serde(default)]
+    pub tcp: Vec<String>,
+    #[serde(default)]
+    pub udp: Vec<String>,
+    /// Parsed `port_block`, filled by `validate`
+    #[serde(skip)]
+    pub block: (u16, u16),
+    /// Expanded `tcp` / `udp`, filled by `validate`
+    #[serde(skip)]
+    pub tcp_ports: Vec<u16>,
+    #[serde(skip)]
+    pub udp_ports: Vec<u16>,
+}
+
+fn validate_users(users: &mut HashMap<String, UserConfig>) -> Result<()> {
+    for (name, u) in users.iter_mut() {
+        u.name = name.clone();
+        let r = parse_port_range(&u.port_block)
+            .with_context(|| format!("Invalid port_block of user {}", name))?;
+        u.block = (*r.start(), *r.end());
+        u.tcp_ports =
+            expand_ports(&u.tcp).with_context(|| format!("Invalid tcp of user {}", name))?;
+        u.udp_ports =
+            expand_ports(&u.udp).with_context(|| format!("Invalid udp of user {}", name))?;
+        if u.tcp_ports.len() + u.udp_ports.len() > r.count() {
+            bail!("User {} exposes more ports than its port_block holds", name);
+        }
+    }
+    let mut blocks: Vec<&UserConfig> = users.values().collect();
+    blocks.sort_by_key(|u| u.block);
+    for w in blocks.windows(2) {
+        if w[0].block.1 >= w[1].block.0 {
+            bail!("port_block of user {} and {} overlap", w[0].name, w[1].name);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -256,39 +339,16 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
-        // Validate services
-        for (name, s) in &mut server.services {
-            s.name = name.clone();
-            if s.token.is_none() {
-                s.token = server.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
-            }
-        }
-
+        validate_users(&mut server.users)?;
         Config::validate_transport_config(&server.transport, true)?;
-
         Ok(())
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
-        // Validate services
-        for (name, s) in &mut client.services {
-            s.name = name.clone();
-            if s.token.is_none() {
-                s.token = client.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
-            }
-            if s.retry_interval.is_none() {
-                s.retry_interval = Some(client.retry_interval);
-            }
+        if client.user.is_empty() {
+            bail!("`client.user` is not set");
         }
-
         Config::validate_transport_config(&client.transport, false)?;
-
         Ok(())
     }
 
@@ -330,9 +390,16 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        Config::from_str(&s).with_context(|| {
+        let mut config = Config::from_str(&s).with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
-        })
+        })?;
+        // `alloc_file` is relative to the config file
+        if let (Some(server), Some(dir)) = (config.server.as_mut(), path.parent()) {
+            if server.alloc_file.is_relative() {
+                server.alloc_file = dir.join(&server.alloc_file);
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -360,16 +427,15 @@ mod tests {
     fn get_all_example_config() -> Result<Vec<PathBuf>> {
         Ok(list_config_files("./examples")?
             .into_iter()
-            .filter(|x| x.ends_with(".toml"))
+            .filter(|x| x.extension().map_or(false, |e| e == "toml"))
             .collect())
     }
 
     #[test]
     fn test_example_config() -> Result<()> {
-        let paths = get_all_example_config()?;
-        for p in paths {
-            let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
+        for p in get_all_example_config()? {
+            let s = fs::read_to_string(&p)?;
+            Config::from_str(&s).with_context(|| format!("{:?}", p))?;
         }
         Ok(())
     }
@@ -395,102 +461,75 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_server_config() -> Result<()> {
-        let mut cfg = ServerConfig::default();
-
-        cfg.services.insert(
-            "foo1".into(),
-            ServerServiceConfig {
-                service_type: ServiceType::Tcp,
-                name: "foo1".into(),
-                bind_addr: "127.0.0.1:80".into(),
-                token: None,
-                ..Default::default()
-            },
-        );
-
-        // Missing the token
-        assert!(Config::validate_server_config(&mut cfg).is_err());
-
-        // Use the default token
-        cfg.default_token = Some("123".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
+    fn test_parse_port_range() {
+        assert_eq!(parse_port_range("3000").unwrap(), 3000..=3000);
+        assert_eq!(parse_port_range(" 8000-8010 ").unwrap(), 8000..=8010);
+        assert!(parse_port_range("0").is_err());
+        assert!(parse_port_range("9-1").is_err());
+        assert!(parse_port_range("abc").is_err());
+        assert!(parse_port_range("70000").is_err());
         assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "123"
+            expand_ports(&["8001-8002".into(), "8000".into(), "8001".into()]).unwrap(),
+            vec![8000, 8001, 8002]
         );
-
-        // The default token won't override the service token
-        cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "4"
-        );
-        Ok(())
     }
 
     #[test]
-    fn test_validate_client_config() -> Result<()> {
-        let mut cfg = ClientConfig::default();
+    fn test_users_config() {
+        let ok = Config::from_str(
+            r#"
+            [server]
+            bind_addr = "0.0.0.0:2333"
+            [server.users.alice]
+            key = "a"
+            port_block = "20000-20999"
+            tcp = ["3000", "8000-8001"]
+            udp = ["5000"]
+            [server.users.bob]
+            key = "b"
+            port_block = "21000"
+            "#,
+        )
+        .unwrap()
+        .server
+        .unwrap()
+        .users;
+        assert_eq!(ok["alice"].name, "alice");
+        assert_eq!(ok["alice"].block, (20000, 20999));
+        assert_eq!(ok["alice"].tcp_ports, vec![3000, 8000, 8001]);
+        assert_eq!(ok["alice"].udp_ports, vec![5000]);
+        assert_eq!(ok["bob"].block, (21000, 21000));
+        assert!(ok["bob"].tcp_ports.is_empty());
 
-        cfg.services.insert(
-            "foo1".into(),
-            ClientServiceConfig {
-                service_type: ServiceType::Tcp,
-                name: "foo1".into(),
-                local_addr: "127.0.0.1:80".into(),
-                token: None,
-                ..Default::default()
-            },
-        );
-
-        // Missing the token
-        assert!(Config::validate_client_config(&mut cfg).is_err());
-
-        // Use the default token
-        cfg.default_token = Some("123".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "123"
-        );
-
-        // The default token won't override the service token
-        cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "4"
-        );
-        Ok(())
+        let bad = |users: &str| {
+            Config::from_str(&format!(
+                "[server]\nbind_addr = \"0.0.0.0:2333\"\n{}",
+                users
+            ))
+            .is_err()
+        };
+        // overlapping blocks
+        assert!(bad(r#"
+            [server.users.alice]
+            key = "a"
+            port_block = "20000-20999"
+            [server.users.bob]
+            key = "b"
+            port_block = "20999-21010"
+            "#));
+        // more ports than the block holds
+        assert!(bad(r#"
+            [server.users.alice]
+            key = "a"
+            port_block = "20000-20001"
+            tcp = ["3000-3002"]
+            "#));
+        // bad port spec
+        assert!(bad(r#"
+            [server.users.alice]
+            key = "a"
+            port_block = "20000"
+            tcp = ["9-1"]
+            "#));
     }
 }

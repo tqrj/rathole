@@ -1,4 +1,4 @@
-use crate::config::{ClientServiceConfig, ServerServiceConfig, TcpConfig, TransportConfig};
+use crate::config::{TcpConfig, TransportConfig};
 use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -139,16 +139,10 @@ impl SocketOpts {
         }
     }
 
-    pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
+    /// Socket options for data channels: only nodelay, None means do not change
+    pub fn nodelay(nodelay: Option<bool>) -> SocketOpts {
         SocketOpts {
-            nodelay: cfg.nodelay,
-            ..SocketOpts::none()
-        }
-    }
-
-    pub fn from_server_cfg(cfg: &ServerServiceConfig) -> SocketOpts {
-        SocketOpts {
-            nodelay: cfg.nodelay,
+            nodelay,
             ..SocketOpts::none()
         }
     }

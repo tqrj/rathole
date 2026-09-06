@@ -1,6 +1,5 @@
 [server]
 bind_addr = "0.0.0.0:2333"
-default_token = "123"
 
 [server.transport]
 type = "tls"
@@ -8,5 +7,7 @@ type = "tls"
 pkcs12 = "examples/tls/identity.pfx"
 pkcs12_password = "1234"
 
-[server.services.foo1]
-bind_addr = "0.0.0.0:5202"
+[server.users.alice]
+key = "alice_secret"
+port_block = "20000-20999"
+tcp = ["80"]

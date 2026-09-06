@@ -1,25 +1,31 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
+use crate::config::ServiceType;
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
+const _PROTO_V1: u8 = 1u8;
+const _PROTO_V2: u8 = 2u8; // user-level auth, client-side port registration, directory
+const PROTO_V3: u8 = 3u8; // exposed ports are configured on the server
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
+
+/// Upper bound of a variable-length frame
+const MAX_FRAME: u32 = 1 << 20;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
-    ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
-    DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    ControlChannelHello(ProtocolVersion, Digest), // sha256sum(user name) or a nonce
+    DataChannelHello(ProtocolVersion, Digest),    // nonce provided by CreateDataChannel
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -28,7 +34,7 @@ pub struct Auth(pub Digest);
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Ack {
     Ok,
-    ServiceNotExist,
+    UserNotExist,
     AuthFailed,
 }
 
@@ -39,23 +45,43 @@ impl std::fmt::Display for Ack {
             "{}",
             match self {
                 Ack::Ok => "Ok",
-                Ack::ServiceNotExist => "Service not exist",
-                Ack::AuthFailed => "Incorrect token",
+                Ack::UserNotExist => "User not exist",
+                Ack::AuthFailed => "Incorrect key",
             }
         )
     }
+}
+
+/// Sent by the server after `Ack::Ok`, once the user's configured ports got
+/// remote ports allocated. `Ok` is followed by a `ControlChannelCmd::Directory`
+#[derive(Deserialize, Serialize, Debug)]
+pub enum RegisterAck {
+    Ok,
+    Err(String),
+}
+
+/// One entry of the global mapping directory
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct Mapping {
+    pub user: String,
+    pub proto: ServiceType,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub online: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum ControlChannelCmd {
     CreateDataChannel,
     HeartBeat,
+    Directory(Vec<Mapping>),
 }
 
+/// The u16 is the local port the client should forward to
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
-    StartForwardTcp,
-    StartForwardUdp,
+    StartForwardTcp(u16),
+    StartForwardUdp(u16),
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -144,8 +170,6 @@ struct PacketLength {
     hello: usize,
     ack: usize,
     auth: usize,
-    c_cmd: usize,
-    d_cmd: usize,
 }
 
 impl PacketLength {
@@ -154,20 +178,11 @@ impl PacketLength {
         let d = digest(username.as_bytes());
         let hello = bincode::serialized_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
             .unwrap() as usize;
-        let c_cmd =
-            bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
-        let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
         let ack = Ack::Ok;
         let ack = bincode::serialized_size(&ack).unwrap() as usize;
 
         let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
-        PacketLength {
-            hello,
-            ack,
-            auth,
-            c_cmd,
-            d_cmd,
-        }
+        PacketLength { hello, ack, auth }
     }
 }
 
@@ -183,16 +198,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
 
     match hello {
-        Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
-        Hello::DataChannelHello(v, _) => {
+        Hello::ControlChannelHello(v, _) | Hello::DataChannelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
@@ -222,22 +228,53 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
-pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<ControlChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
+/// Write a length-prefixed (u32 BE) bincode frame and flush
+pub async fn write_frame<T: Serialize, W: AsyncWrite + Unpin>(w: &mut W, v: &T) -> Result<()> {
+    let body = bincode::serialize(v).with_context(|| "Failed to serialize frame")?;
+    if body.len() as u64 > MAX_FRAME as u64 {
+        bail!("Frame too large: {} bytes", body.len());
+    }
+    w.write_u32(body.len() as u32).await?;
+    w.write_all(&body).await?;
+    w.flush().await?;
+    Ok(())
 }
 
-pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
+/// Read a length-prefixed (u32 BE) bincode frame
+pub async fn read_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> Result<T> {
+    let len = r
+        .read_u32()
         .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+        .with_context(|| "Failed to read frame length")?;
+    if len > MAX_FRAME {
+        bail!("Frame too large: {} bytes", len);
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read frame")?;
+    bincode::deserialize(&buf).with_context(|| "Failed to deserialize frame")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_frame_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let cmd = ControlChannelCmd::Directory(vec![Mapping {
+            user: "alice".into(),
+            proto: ServiceType::Tcp,
+            local_port: 3000,
+            remote_port: 20000,
+            online: true,
+        }]);
+        write_frame(&mut a, &cmd).await.unwrap();
+        let got: ControlChannelCmd = read_frame(&mut b).await.unwrap();
+        match got {
+            ControlChannelCmd::Directory(d) => assert_eq!(d[0].remote_port, 20000),
+            _ => panic!("wrong frame"),
+        }
+    }
 }
