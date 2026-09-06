@@ -4,8 +4,8 @@ use crate::helper::{host_port_pair, retry_notify_with_deadline};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, write_frame, Ack, ControlChannelCmd, DataChannelCmd, Hello,
-    Mapping, RegisterAck, UdpTraffic, HASH_WIDTH_IN_BYTES,
+    self, read_auth, read_frame, read_hello, write_frame, Ack, ClientCmd, ControlChannelCmd,
+    DataChannelCmd, Hello, Mapping, RegisterAck, UdpTraffic, HASH_WIDTH_IN_BYTES,
 };
 use crate::registry::Registry;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
@@ -17,7 +17,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::time;
@@ -240,12 +240,7 @@ async fn run_nginx_map(cfg: NginxConfig, mut rx: DirectoryRx) {
 fn render_nginx_map(dir: &[Mapping], domain: &str) -> String {
     dir.iter()
         .filter(|m| m.proto == ServiceType::Tcp)
-        .map(|m| {
-            format!(
-                "{}-{}.{} {};\n",
-                m.local_port, m.user, domain, m.remote_port
-            )
-        })
+        .map(|m| format!("{} {};\n", m.host(domain), m.remote_port))
         .collect()
 }
 
@@ -385,7 +380,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             return Err(e).with_context(|| format!("User {} failed to register", user.name));
         }
     };
-    write_frame(&mut conn, &RegisterAck::Ok).await?;
+    let domain = server_config.nginx.as_ref().map(|n| n.domain.clone());
+    write_frame(&mut conn, &RegisterAck::Ok(domain)).await?;
 
     let mut h = control_channels.write().await;
 
@@ -560,9 +556,26 @@ where
             };
         }
 
+        // Frames from the client are read by a task: `read_frame` is not
+        // cancel-safe, so it can't sit in the `select!` below
+        let (rd, wr) = io::split(conn);
+        let (client_tx, client_rx) = mpsc::channel(8);
+        let reader = tokio::spawn(async move {
+            let mut rd = rd;
+            loop {
+                let r = read_frame::<ClientCmd, _>(&mut rd).await;
+                let err = r.is_err();
+                if client_tx.send(r).await.is_err() || err {
+                    break;
+                }
+            }
+        });
+
         // Create the control channel
         let ch = ControlChannel::<T> {
-            conn,
+            wr,
+            client_rx,
+            reader,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
@@ -596,11 +609,13 @@ where
 
 // Control channel, using T as the transport layer
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
+    wr: WriteHalf<T::Stream>, // The connection of control channel
+    client_rx: mpsc::Receiver<Result<ClientCmd>>, // Frames sent by the client
+    reader: tokio::task::JoinHandle<()>, // Holds the read half; aborted on exit so the socket closes
+    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
-    dir_rx: DirectoryRx,                           // Directory updates to push
+    heartbeat_interval: u64,             // Application-layer heartbeat interval in secs
+    dir_rx: DirectoryRx,                 // Directory updates to push
     user: String,
     nonce: Nonce,
     registry: SharedRegistry,
@@ -609,7 +624,7 @@ struct ControlChannel<T: Transport> {
 
 impl<T: Transport> ControlChannel<T> {
     async fn send(&mut self, cmd: &ControlChannelCmd) -> Result<()> {
-        write_frame(&mut self.conn, cmd)
+        write_frame(&mut self.wr, cmd)
             .await
             .with_context(|| "Failed to write control cmds")
     }
@@ -622,7 +637,6 @@ impl<T: Transport> ControlChannel<T> {
         self.send(&ControlChannelCmd::Directory(dir.as_ref().clone()))
             .await?;
 
-        let mut byte = [0u8; 1];
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
@@ -655,10 +669,22 @@ impl<T: Transport> ControlChannel<T> {
                         break;
                     }
                 },
-                // The client never writes after registration, so anything here means it's gone
-                _ = self.conn.read(&mut byte) => {
-                    info!("Client disconnected");
-                    break;
+                val = self.client_rx.recv() => {
+                    match val {
+                        Some(Ok(ClientCmd::Disabled(ports))) => {
+                            info!("Disabled ports {:?}", ports);
+                            self.registry.lock().unwrap().set_disabled(&self.user, self.nonce, ports);
+                        }
+                        Some(Err(e)) => {
+                            debug!("{:#}", e);
+                            info!("Client disconnected");
+                            break;
+                        }
+                        None => {
+                            info!("Client disconnected");
+                            break;
+                        }
+                    }
                 },
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
@@ -666,6 +692,8 @@ impl<T: Transport> ControlChannel<T> {
                 }
             }
         }
+
+        self.reader.abort();
 
         // Remove ourselves (only this session, keyed by nonce) so the listeners close
         if let Some(m) = self.control_channels.upgrade() {

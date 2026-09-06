@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>rathole</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 16px; color: #222; background: #fafafa; }
+  h2 { font-size: 15px; margin: 20px 0 8px; }
+  .bar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #c33; margin-right: 6px; }
+  .dot.on { background: #2a2; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e5e5e5; white-space: nowrap; }
+  th { background: #f0f0f0; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .st-online { color: #2a2; } .st-disabled { color: #c60; } .st-offline, .st-notlistening { color: #999; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+  button { padding: 2px 10px; }
+  textarea { width: 100%; height: 220px; font: 13px/1.4 ui-monospace, monospace; box-sizing: border-box; }
+  .err { color: #c33; white-space: pre-wrap; }
+  .ok { color: #2a2; }
+  .muted { color: #777; font-size: 12px; }
+  th.sort { cursor: pointer; user-select: none; }
+  th.sort:hover { text-decoration: underline; }
+  .copy { cursor: pointer; border-bottom: 1px dashed #aaa; }
+  .copy:hover { color: #06c; }
+  .copy.done { color: #2a2; border-bottom-color: #2a2; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <span><span id="dot" class="dot"></span><span id="conn">未连接</span></span>
+  <span>我：<b id="me">-</b></span>
+  <span>在线用户：<span id="users">-</span></span>
+  <label><input type="checkbox" id="all"> 显示全部端口</label>
+</div>
+
+<h2>端口目录</h2>
+<table>
+  <thead><tr><th class="sort" data-key="user">USER</th><th>PROTO</th><th class="sort" data-key="local_port">LOCAL</th><th class="sort" data-key="remote_port">REMOTE</th><th>STATUS</th><th>ALIAS</th><th id="domh" hidden>DOMAIN</th><th></th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<p class="muted">ALIAS：本机 <code>alias_bind:remote_port</code> 监听，转发到该用户的服务。DOMAIN：经 nginx 访问该映射的域名。点击 REMOTE 复制服务端 IP:端口，点击 DOMAIN 复制域名；点击 USER / LOCAL / REMOTE 表头排序。关闭自己的端口后，服务端把它标为 offline，访客连接会被立即断开。</p>
+
+<h2>配置 <span id="cfgpath" class="muted"></span></h2>
+<textarea id="cfg" spellcheck="false"></textarea>
+<div><button id="save">保存</button> <span id="msg"></span></div>
+<p class="muted">保存前会校验；保存后客户端自动重新加载配置并重连。</p>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const $ = id => document.getElementById(id);
+let state = null;
+let sortKey = null, sortDir = 1;
+
+// Mirrors `row_status` in src/client.rs
+function rowStatus(m, st) {
+  if (m.user !== st.user) return m.online ? 'online' : 'offline';
+  if (st.disabled.includes(m.local_port)) return 'disabled';
+  if (!m.online) return 'offline';
+  if (m.proto === 'tcp' && !st.listening.includes(m.local_port)) return 'not listening';
+  return 'online';
+}
+
+function render() {
+  const st = state; if (!st) return;
+  $('dot').className = 'dot' + (st.connected ? ' on' : '');
+  $('conn').textContent = st.connected ? '已连接' : '未连接';
+  $('me').textContent = st.user || '-';
+  const users = [...new Set(st.directory.filter(m => m.online).map(m => m.user))];
+  $('users').textContent = users.length ? users.join(', ') : '无';
+  $('domh').hidden = !st.domain;
+  const showAll = $('all').checked;
+  for (const th of document.querySelectorAll('th.sort')) {
+    th.textContent = th.dataset.key.replace('_port', '').toUpperCase() + (th.dataset.key === sortKey ? (sortDir > 0 ? ' ▲' : ' ▼') : '');
+  }
+  const dir = [...st.directory];
+  if (sortKey) dir.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
+  const rows = $('rows'); rows.innerHTML = '';
+  for (const m of dir) {
+    const status = rowStatus(m, st);
+    if (!showAll && status !== 'online' && status !== 'disabled') continue;
+    const mine = m.user === st.user;
+    const alias = m.online && m.proto === 'tcp' && !mine ? `${st.alias_bind}:${m.remote_port}` : '-';
+    const domain = st.domain ? (m.proto === 'tcp' ? `${m.local_port}-${m.user}.${st.domain}` : '-') : '';
+    const tr = document.createElement('tr');
+    const remote = `${st.server_host}:${m.remote_port}`;
+    tr.innerHTML = `<td>${m.user}</td><td>${m.proto}</td><td class="num">${m.local_port}</td>` +
+      `<td class="num"><span class="copy" data-copy="${remote}" title="复制 ${remote}">${m.remote_port}</span></td>` +
+      `<td class="st-${status.replace(' ', '')}">${status}</td><td>${alias}</td>` +
+      (st.domain ? `<td>${domain === '-' ? '-' : `<span class="copy" data-copy="${domain}" title="复制">${domain}</span>`}</td>` : '') +
+      `<td>${mine ? `<button data-port="${m.local_port}" data-on="${status !== 'disabled'}">${status === 'disabled' ? '开启' : '关闭'}</button>` : ''}</td>`;
+    rows.appendChild(tr);
+  }
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (_) {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+}
+
+$('rows').addEventListener('click', async e => {
+  const c = e.target.closest('.copy');
+  if (c) {
+    await copyText(c.dataset.copy);
+    c.classList.add('done'); setTimeout(() => c.classList.remove('done'), 800);
+    return;
+  }
+  const b = e.target.closest('button'); if (!b) return;
+  invoke('set_port', { port: Number(b.dataset.port), enabled: b.dataset.on !== 'true' });
+});
+document.querySelector('thead').addEventListener('click', e => {
+  const th = e.target.closest('th.sort'); if (!th) return;
+  if (sortKey === th.dataset.key) sortDir = -sortDir; else { sortKey = th.dataset.key; sortDir = 1; }
+  render();
+});
+$('all').addEventListener('change', render);
+
+$('save').addEventListener('click', async () => {
+  const msg = $('msg');
+  try { await invoke('save_config', { text: $('cfg').value }); msg.className = 'ok'; msg.textContent = '已保存'; }
+  catch (e) { msg.className = 'err'; msg.textContent = String(e); }
+});
+
+(async () => {
+  await listen('state', ev => { state = ev.payload; render(); });
+  state = await invoke('get_state'); render();
+  try { $('cfg').value = await invoke('read_config'); } catch (e) { $('msg').className = 'err'; $('msg').textContent = String(e); }
+})();
+</script>
+</body>
+</html>

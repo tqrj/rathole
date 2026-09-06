@@ -22,6 +22,8 @@ use tracing::{debug, info};
 mod client;
 #[cfg(feature = "client")]
 use client::run_client;
+#[cfg(feature = "client")]
+pub use client::{client_state, render_directory, set_port_enabled, ClientState};
 
 #[cfg(feature = "server")]
 mod server;
@@ -70,8 +72,11 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     fdlimit::raise_fd_limit();
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
-    let config_path = args.config_path.as_ref().unwrap();
-    let mut cfg_watcher = ConfigWatcherHandle::new(config_path, shutdown_rx).await?;
+    let config_path = args
+        .config_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("client.toml"));
+    let mut cfg_watcher = ConfigWatcherHandle::new(&config_path, shutdown_rx).await?;
 
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);

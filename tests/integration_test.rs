@@ -183,6 +183,14 @@ async fn alias() -> Result<()> {
     time::sleep(Duration::from_secs(1)).await;
     tcp_echo_hitter(ALIAS_ADDR).await?;
 
+    // alice turns 8082 off: the server marks it offline and bob's alias closes
+    rathole::set_port_enabled(8082, false);
+    time::sleep(Duration::from_secs(1)).await;
+    assert!(TcpStream::connect(ALIAS_ADDR).await.is_err());
+    rathole::set_port_enabled(8082, true);
+    time::sleep(Duration::from_secs(1)).await;
+    tcp_echo_hitter(ALIAS_ADDR).await?;
+
     // Allocation is stable across reconnects
     let alloc = std::fs::read_to_string("target/alloc_alias.toml")?;
     assert!(alloc.contains("remote_port = 2336"));

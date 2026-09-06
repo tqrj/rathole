@@ -41,11 +41,11 @@ cargo Features:      {}
 )]
 #[clap(group(
             ArgGroup::new("cmds")
-                .required(true)
+                .required(false)
                 .args(&["CONFIG", "genkey"]),
         ))]
 pub struct Cli {
-    /// The path to the configuration file
+    /// The path to the configuration file. Default: `client.toml` in the current directory
     ///
     /// Running as a client or a server is automatically determined
     /// according to the configuration file.

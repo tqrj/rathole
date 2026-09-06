@@ -2,8 +2,8 @@ use crate::config::{ClientConfig, Config, ServiceType, TransportType};
 use crate::helper::{host_port_pair, udp_connect};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_frame, read_hello, Ack, Auth, ControlChannelCmd, DataChannelCmd, Mapping,
-    RegisterAck, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, read_ack, read_frame, read_hello, write_frame, Ack, Auth, ClientCmd, ControlChannelCmd,
+    DataChannelCmd, Mapping, RegisterAck, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -11,12 +11,14 @@ use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
+use lazy_static::lazy_static;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -29,6 +31,52 @@ use crate::transport::TlsTransport;
 use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+
+/// How often the client checks which of its own local ports are listening
+const PROBE_INTERVAL_SECS: u64 = 5;
+
+/// What the client currently knows, for the CLI table and the desktop UI
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct ClientState {
+    pub connected: bool,
+    pub user: String,
+    pub alias_bind: String,
+    /// Host part of `remote_addr`; remote ports are reachable at `<server_host>:<remote_port>`
+    pub server_host: String,
+    /// `server.nginx.domain`, if the server has one
+    pub domain: Option<String>,
+    pub directory: Vec<Mapping>,
+    /// Own local TCP ports that accept connections right now
+    pub listening: Vec<u16>,
+    /// Own local ports turned off with `set_port_enabled`
+    pub disabled: Vec<u16>,
+}
+
+// ponytail: process-wide state, one client per process. Survives hot-reload
+// restarts on purpose (disabled ports stay disabled).
+lazy_static! {
+    static ref STATE: watch::Sender<ClientState> = watch::channel(ClientState::default()).0;
+    static ref DISABLED: watch::Sender<Vec<u16>> = watch::channel(Vec::new()).0;
+}
+
+pub fn client_state() -> watch::Receiver<ClientState> {
+    STATE.subscribe()
+}
+
+/// Turn exposing a local port on or off. Takes effect on the next directory push.
+pub fn set_port_enabled(port: u16, enabled: bool) {
+    DISABLED.send_modify(|v| {
+        v.retain(|p| *p != port);
+        if !enabled {
+            v.push(port);
+            v.sort_unstable();
+        }
+    });
+}
+
+fn update_state(f: impl FnOnce(&mut ClientState)) {
+    STATE.send_modify(f);
+}
 
 // The entrypoint of running a client
 pub async fn run_client(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
@@ -154,7 +202,15 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
     // Forward. The server tells us which local port this channel is for
-    match read_frame(&mut conn).await? {
+    let cmd: DataChannelCmd = read_frame(&mut conn).await?;
+    let port = match cmd {
+        DataChannelCmd::StartForwardTcp(p) | DataChannelCmd::StartForwardUdp(p) => p,
+    };
+    if DISABLED.borrow().contains(&port) {
+        debug!("Refusing data channel for disabled port {}", port);
+        return Ok(());
+    }
+    match cmd {
         DataChannelCmd::StartForwardTcp(port) => {
             run_data_channel_for_tcp::<T>(conn, &format!("127.0.0.1:{}", port)).await?;
         }
@@ -321,29 +377,77 @@ async fn run_udp_forwarder(
     Ok(())
 }
 
-/// Print the mapping directory as a table
-fn print_directory(dir: &[Mapping], me: &str, alias_bind: &str) {
+/// Status of a directory row as seen by this client
+fn row_status(m: &Mapping, st: &ClientState) -> &'static str {
+    if m.user != st.user {
+        return if m.online { "online" } else { "offline" };
+    }
+    if st.disabled.contains(&m.local_port) {
+        "disabled"
+    } else if !m.online {
+        "offline"
+    } else if m.proto == ServiceType::Tcp && !st.listening.contains(&m.local_port) {
+        "not listening"
+    } else {
+        "online"
+    }
+}
+
+/// Render the directory as a table. Without `show_all` only ports that are
+/// reachable (online, or own ports turned off) are listed.
+pub fn render_directory(st: &ClientState, show_all: bool) -> String {
     let mut out = format!(
-        "\n{:<12} {:<5} {:>6} {:>7} {:<8} ALIAS\n",
-        "USER", "PROTO", "LOCAL", "REMOTE", "STATUS"
+        "\n{:<12} {:<5} {:>6} {:>7} {:<13} {:<21}{}\n",
+        "USER",
+        "PROTO",
+        "LOCAL",
+        "REMOTE",
+        "STATUS",
+        "ALIAS",
+        if st.domain.is_some() { " DOMAIN" } else { "" }
     );
-    for m in dir {
-        let alias = if m.online && m.proto == ServiceType::Tcp && m.user != me {
-            format!("{}:{}", alias_bind, m.remote_port)
+    for m in &st.directory {
+        let status = row_status(m, st);
+        if !show_all && status != "online" && status != "disabled" {
+            continue;
+        }
+        let alias = if m.online && m.proto == ServiceType::Tcp && m.user != st.user {
+            format!("{}:{}", st.alias_bind, m.remote_port)
         } else {
             String::from("-")
         };
+        let domain = match &st.domain {
+            Some(d) if m.proto == ServiceType::Tcp => format!(" {}", m.host(d)),
+            Some(_) => String::from(" -"),
+            None => String::new(),
+        };
         out += &format!(
-            "{:<12} {:<5} {:>6} {:>7} {:<8} {}\n",
-            m.user,
-            m.proto,
-            m.local_port,
-            m.remote_port,
-            if m.online { "online" } else { "offline" },
-            alias
+            "{:<12} {:<5} {:>6} {:>7} {:<13} {:<21}{}\n",
+            m.user, m.proto, m.local_port, m.remote_port, status, alias, domain
         );
     }
-    println!("{}", out);
+    out += "ALIAS: <alias_bind>:<remote_port> on this machine forwards to that user's service.";
+    if st.domain.is_some() {
+        out += " DOMAIN: nginx host name of the mapping.";
+    }
+    out += "\n";
+    out
+}
+
+/// Own local TCP ports of `dir` that accept a connection right now
+async fn probe_listening(dir: &[Mapping], me: &str) -> Vec<u16> {
+    let mut v = Vec::new();
+    for m in dir {
+        if m.user == me && m.proto == ServiceType::Tcp && !v.contains(&m.local_port) {
+            let addr = format!("127.0.0.1:{}", m.local_port);
+            if let Ok(Ok(_)) =
+                time::timeout(Duration::from_millis(200), TcpStream::connect(&addr)).await
+            {
+                v.push(m.local_port);
+            }
+        }
+    }
+    v
 }
 
 /// Alias listeners: `<alias_bind>:<remote_port>` on this machine forwarding to
@@ -502,13 +606,27 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // The server allocates remote ports for the ports configured for this user
         debug!("Waiting for registration");
-        match read_frame(&mut conn).await? {
-            RegisterAck::Ok => {}
+        let domain = match read_frame(&mut conn).await? {
+            RegisterAck::Ok(domain) => domain,
             RegisterAck::Err(e) => bail!("Registration rejected: {}", e),
-        }
+        };
 
         // Channel ready
         info!("Control channel established");
+        let me = self.config.user.clone();
+        let alias_bind = self.config.alias_bind.clone();
+        let (server_host, _) = host_port_pair(&self.config.remote_addr)?;
+        update_state(|st| {
+            *st = ClientState {
+                connected: true,
+                user: me.clone(),
+                alias_bind: alias_bind.clone(),
+                server_host: server_host.to_owned(),
+                domain,
+                disabled: DISABLED.borrow().clone(),
+                ..Default::default()
+            }
+        });
 
         // Socket options for the data channel
         let socket_opts = SocketOpts::nodelay(self.config.nodelay);
@@ -520,18 +638,45 @@ impl<T: 'static + Transport> ControlChannel<T> {
             prefer_ipv6: self.config.prefer_ipv6,
         });
 
-        let (server_host, _) = host_port_pair(&self.config.remote_addr)?;
         let mut aliases = Aliases {
-            bind_host: self.config.alias_bind.clone(),
+            bind_host: alias_bind,
             server_host: server_host.to_owned(),
-            me: self.config.user.clone(),
+            me: me.clone(),
             tasks: HashMap::new(),
         };
 
-        loop {
+        let (mut rd, mut wr) = io::split(conn);
+
+        // Tell the server which ports are turned off, now and on every change
+        let mut disabled_rx = DISABLED.subscribe();
+        let disabled = disabled_rx.borrow_and_update().clone();
+        if !disabled.is_empty() {
+            write_frame(&mut wr, &ClientCmd::Disabled(disabled)).await?;
+        }
+
+        // Frames from the server are read by a task: `read_frame` is not
+        // cancel-safe, so it can't sit in the `select!` below
+        let (frame_tx, mut frame_rx) = mpsc::channel(8);
+        let reader = tokio::spawn(async move {
+            loop {
+                let r = read_frame::<ControlChannelCmd, _>(&mut rd).await;
+                let err = r.is_err();
+                if frame_tx.send(r).await.is_err() || err {
+                    break;
+                }
+            }
+        });
+
+        let mut probe = time::interval(Duration::from_secs(PROBE_INTERVAL_SECS));
+
+        let result = loop {
             tokio::select! {
-                val = read_frame::<ControlChannelCmd, _>(&mut conn) => {
-                    let val = val?;
+                val = frame_rx.recv() => {
+                    let val = match val {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => break Err(e),
+                        None => break Err(anyhow!("Control channel closed")),
+                    };
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
                             debug!("Received CreateDataChannel");
@@ -544,19 +689,40 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         },
                         ControlChannelCmd::HeartBeat => (),
                         ControlChannelCmd::Directory(dir) => {
-                            print_directory(&dir, &self.config.user, &self.config.alias_bind);
+                            let listening = probe_listening(&dir, &me).await;
                             aliases.apply(&dir);
+                            update_state(|st| { st.directory = dir; st.listening = listening; });
+                            println!("{}", render_directory(&STATE.borrow(), false));
                         }
                     }
                 },
+                _ = probe.tick() => {
+                    let dir = STATE.borrow().directory.clone();
+                    let listening = probe_listening(&dir, &me).await;
+                    if listening != STATE.borrow().listening {
+                        update_state(|st| st.listening = listening);
+                        println!("{}", render_directory(&STATE.borrow(), false));
+                    }
+                },
+                Ok(()) = disabled_rx.changed() => {
+                    let disabled = disabled_rx.borrow_and_update().clone();
+                    if let Err(e) = write_frame(&mut wr, &ClientCmd::Disabled(disabled.clone())).await {
+                        break Err(e);
+                    }
+                    update_state(|st| st.disabled = disabled);
+                },
                 _ = time::sleep(Duration::from_secs(self.config.heartbeat_timeout)), if self.config.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
+                    break Err(anyhow!("Heartbeat timed out"));
                 }
                 _ = &mut self.shutdown_rx => {
-                    break;
+                    break Ok(());
                 }
             }
-        }
+        };
+
+        reader.abort();
+        update_state(|st| st.connected = false);
+        result?;
 
         info!("Control channel shutdown");
         Ok(())
@@ -621,5 +787,44 @@ impl ControlChannelHandle {
     fn shutdown(self) {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_directory() {
+        let m = |user: &str, local_port, remote_port, online| Mapping {
+            user: user.into(),
+            proto: ServiceType::Tcp,
+            local_port,
+            remote_port,
+            online,
+        };
+        let st = ClientState {
+            connected: true,
+            user: "alice".into(),
+            alias_bind: "127.0.0.1".into(),
+            server_host: "srv".into(),
+            domain: Some("example.com".into()),
+            directory: vec![
+                m("alice", 80, 20000, true),
+                m("alice", 81, 20001, true),
+                m("alice", 82, 20002, false),
+                m("bob", 3000, 21000, true),
+                m("bob", 3001, 21001, false),
+            ],
+            listening: vec![80, 82],
+            disabled: vec![82],
+        };
+        let out = render_directory(&st, false);
+        assert!(out.contains("80-alice.example.com"));
+        assert!(out.contains("disabled"));
+        assert!(out.contains("127.0.0.1:21000"));
+        assert!(!out.contains("20001") && !out.contains("21001"));
+        let all = render_directory(&st, true);
+        assert!(all.contains("not listening") && all.contains("21001"));
     }
 }

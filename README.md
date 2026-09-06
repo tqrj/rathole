@@ -20,6 +20,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - [rathole](#rathole)
   - [Features](#features)
   - [Quickstart](#quickstart)
+  - [Directory](#directory)
+    - [Desktop app](#desktop-app)
   - [Configuration](#configuration)
     - [Logging](#logging)
     - [Tuning](#tuning)
@@ -90,6 +92,35 @@ Then run:
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
 To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+
+## Directory
+
+Every client prints the global mapping directory whenever it changes:
+
+```
+USER         PROTO  LOCAL  REMOTE STATUS        ALIAS                 DOMAIN
+alice        tcp    5173    5173 online        -                     5173-alice.example.com
+bob          tcp    3000   21000 online        127.0.0.1:21000       3000-bob.example.com
+```
+
+- `LOCAL` / `REMOTE`: the local port on the user's machine and the port the server exposes it on. A local port whose number lies inside the user's `port_block` keeps its number; otherwise the lowest free port of the block is taken. Allocations are persisted in `alloc_file`.
+- `STATUS`: `online`, `offline`, `disabled` (turned off from the desktop app) or `not listening` (own port with nothing bound locally).
+- `ALIAS`: for other users' online TCP mappings the client opens `<alias_bind>:<remote_port>` on this machine and forwards it to the server, so their service is reachable as if it were local.
+- `DOMAIN`: shown when the server has `[server.nginx]`; the host name nginx maps to the remote port.
+
+Only ports that are reachable are listed: own TCP ports are probed every few seconds and hidden while nothing listens on them; other users' offline mappings are hidden too. Without a config path `rathole` reads `client.toml` from the current directory.
+
+### Desktop app
+
+`desktop/` is a [Tauri 2](https://v2.tauri.app) UI around the client: it shows the connected users and the directory, lets you turn your own ports off and on (the server marks them offline and other clients close their aliases), edits the config file in place (validated before saving, the client reloads it automatically) and has a "show all ports" toggle.
+
+```sh
+cd desktop
+cargo run -- path/to/client.toml     # defaults to ./client.toml, written with a template if missing
+npx @tauri-apps/cli@^2 build         # installers in desktop/target/release/bundle
+```
+
+It uses the `stable` toolchain (`desktop/rust-toolchain.toml`), not the 1.71 pinned for the CLI.
 
 ## Configuration
 

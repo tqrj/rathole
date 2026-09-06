@@ -5,3 +5,7 @@ allocations.toml
 /dist
 .DS_Store
 /.idea
+
+# desktop app
+desktop/target
+desktop/gen

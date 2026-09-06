@@ -13,9 +13,10 @@ type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
 const _PROTO_V2: u8 = 2u8; // user-level auth, client-side port registration, directory
-const PROTO_V3: u8 = 3u8; // exposed ports are configured on the server
+const _PROTO_V3: u8 = 3u8; // exposed ports are configured on the server
+const PROTO_V4: u8 = 4u8; // RegisterAck carries the nginx domain, client can disable ports
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V4;
 
 /// Upper bound of a variable-length frame
 const MAX_FRAME: u32 = 1 << 20;
@@ -53,11 +54,19 @@ impl std::fmt::Display for Ack {
 }
 
 /// Sent by the server after `Ack::Ok`, once the user's configured ports got
-/// remote ports allocated. `Ok` is followed by a `ControlChannelCmd::Directory`
+/// remote ports allocated. `Ok` carries the nginx domain (if configured) and
+/// is followed by a `ControlChannelCmd::Directory`
 #[derive(Deserialize, Serialize, Debug)]
 pub enum RegisterAck {
-    Ok,
+    Ok(Option<String>),
     Err(String),
+}
+
+/// The only client -> server frame after registration
+#[derive(Deserialize, Serialize, Debug)]
+pub enum ClientCmd {
+    /// Local ports the client stopped exposing; the server marks them offline
+    Disabled(Vec<u16>),
 }
 
 /// One entry of the global mapping directory
@@ -68,6 +77,13 @@ pub struct Mapping {
     pub local_port: u16,
     pub remote_port: u16,
     pub online: bool,
+}
+
+impl Mapping {
+    /// nginx host name of a TCP mapping: `<local_port>-<user>.<domain>`
+    pub fn host(&self, domain: &str) -> String {
+        format!("{}-{}.{}", self.local_port, self.user, domain)
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]

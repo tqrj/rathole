@@ -23,11 +23,19 @@ struct Alloc {
     remote_port: u16,
 }
 
+/// The current session of an online user
+struct Session {
+    nonce: Digest,
+    /// Local ports registered by that session
+    ports: Vec<(ServiceType, u16)>,
+    /// Local ports the client turned off
+    disabled: Vec<u16>,
+}
+
 pub struct Registry {
     path: PathBuf,
     allocs: Vec<Alloc>,
-    // user -> (session nonce, local ports registered by that session)
-    online: HashMap<String, (Digest, Vec<(ServiceType, u16)>)>,
+    online: HashMap<String, Session>,
     dir_tx: watch::Sender<Arc<Vec<Mapping>>>,
 }
 
@@ -73,6 +81,10 @@ impl Registry {
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
+        // Local ports that fit in the block get their own number (allocated
+        // first so a sequential allocation doesn't take it), the rest the
+        // lowest free port
+        wanted.sort_by_key(|(_, p)| !(lo..=hi).contains(p));
 
         // Work on a copy so a failed persist (or an exhausted block) leaves
         // the in-memory table untouched and the next attempt retries the write
@@ -95,7 +107,8 @@ impl Registry {
                 .filter(|a| a.user == user.name)
                 .map(|a| a.remote_port)
                 .collect();
-            let remote_port = match (lo..=hi).find(|p| !used.contains(p)) {
+            let same = Some(*local_port).filter(|p| (lo..=hi).contains(p) && !used.contains(p));
+            let remote_port = match same.or_else(|| (lo..=hi).find(|p| !used.contains(p))) {
                 Some(p) => p,
                 None => bail!(
                     "Port block {}-{} of user {} is exhausted",
@@ -117,7 +130,14 @@ impl Registry {
             self.allocs = allocs;
         }
 
-        self.online.insert(user.name.clone(), (nonce, wanted));
+        self.online.insert(
+            user.name.clone(),
+            Session {
+                nonce,
+                ports: wanted,
+                disabled: Vec::new(),
+            },
+        );
         self.publish();
 
         Ok(self
@@ -129,8 +149,16 @@ impl Registry {
 
     /// Mark the session offline. Ignored if `nonce` is not the current session of `user`.
     pub fn unregister(&mut self, user: &str, nonce: Digest) {
-        if self.online.get(user).map(|(n, _)| *n) == Some(nonce) {
+        if self.online.get(user).map(|s| s.nonce) == Some(nonce) {
             self.online.remove(user);
+            self.publish();
+        }
+    }
+
+    /// Local ports the client turned off. Ignored if `nonce` is not the current session.
+    pub fn set_disabled(&mut self, user: &str, nonce: Digest, disabled: Vec<u16>) {
+        if let Some(s) = self.online.get_mut(user).filter(|s| s.nonce == nonce) {
+            s.disabled = disabled;
             self.publish();
         }
     }
@@ -144,10 +172,10 @@ impl Registry {
                 proto: a.proto,
                 local_port: a.local_port,
                 remote_port: a.remote_port,
-                online: self
-                    .online
-                    .get(&a.user)
-                    .map_or(false, |(_, ports)| ports.contains(&(a.proto, a.local_port))),
+                online: self.online.get(&a.user).map_or(false, |s| {
+                    s.ports.contains(&(a.proto, a.local_port))
+                        && !s.disabled.contains(&a.local_port)
+                }),
             })
             .collect();
         v.sort_by(|a, b| (&a.user, a.remote_port).cmp(&(&b.user, b.remote_port)));
@@ -238,6 +266,20 @@ mod tests {
         let mut r3 = r2;
         let m = r3.register(&alice2, n1).unwrap();
         assert_eq!(remote(&m, ServiceType::Tcp, 3000), Some(30000));
+
+        // A local port inside the block keeps its number, even if listed later
+        let dev = user("dev", 5000, 5002, &[3000, 5001], &[]);
+        let m = r3.register(&dev, n2).unwrap();
+        assert_eq!(remote(&m, ServiceType::Tcp, 5001), Some(5001));
+        assert_eq!(remote(&m, ServiceType::Tcp, 3000), Some(5000));
+
+        // The client can turn a port off; a stale nonce can't
+        r3.set_disabled("dev", n1, vec![5001]);
+        assert!(m.iter().all(|x| x.online));
+        r3.set_disabled("dev", n2, vec![5001]);
+        let d = r3.directory();
+        assert!(!d.iter().find(|x| x.local_port == 5001).unwrap().online);
+        assert!(d.iter().find(|x| x.local_port == 3000).unwrap().online);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -337,7 +337,8 @@ pub struct Config {
 }
 
 impl Config {
-    fn from_str(s: &str) -> Result<Config> {
+    /// Parse and validate a config. Paths are not resolved (see `from_file`)
+    pub fn parse(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
         if let Some(server) = config.server.as_mut() {
@@ -407,7 +408,7 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        let mut config = Config::from_str(&s).with_context(|| {
+        let mut config = Config::parse(&s).with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
         })?;
         // Server-side file paths are relative to the config file
@@ -455,7 +456,7 @@ mod tests {
     fn test_example_config() -> Result<()> {
         for p in get_all_example_config()? {
             let s = fs::read_to_string(&p)?;
-            Config::from_str(&s).with_context(|| format!("{:?}", p))?;
+            Config::parse(&s).with_context(|| format!("{:?}", p))?;
         }
         Ok(())
     }
@@ -465,7 +466,7 @@ mod tests {
         let paths = list_config_files("tests/config_test/valid_config")?;
         for p in paths {
             let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
+            Config::parse(&s)?;
         }
         Ok(())
     }
@@ -475,7 +476,7 @@ mod tests {
         let paths = list_config_files("tests/config_test/invalid_config")?;
         for p in paths {
             let s = fs::read_to_string(p)?;
-            assert!(Config::from_str(&s).is_err());
+            assert!(Config::parse(&s).is_err());
         }
         Ok(())
     }
@@ -496,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_users_config() {
-        let ok = Config::from_str(
+        let ok = Config::parse(
             r#"
             [server]
             bind_addr = "0.0.0.0:2333"
@@ -522,7 +523,7 @@ mod tests {
         assert!(ok["bob"].tcp_ports.is_empty());
 
         let bad = |users: &str| {
-            Config::from_str(&format!(
+            Config::parse(&format!(
                 "[server]\nbind_addr = \"0.0.0.0:2333\"\n{}",
                 users
             ))
