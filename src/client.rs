@@ -459,13 +459,30 @@ struct Aliases {
     tasks: HashMap<u16, JoinHandle<()>>,
 }
 
+/// Remote ports of other users' online TCP mappings that get an alias on this
+/// machine. Ports that are one of our own exposed local ports are skipped: the
+/// alias would shadow the local service (and our own data channels).
+fn alias_ports(dir: &[Mapping], me: &str) -> HashSet<u16> {
+    let mine: HashSet<u16> = dir
+        .iter()
+        .filter(|m| m.user == me)
+        .map(|m| m.local_port)
+        .collect();
+    dir.iter()
+        .filter(|m| m.online && m.proto == ServiceType::Tcp && m.user != me)
+        .map(|m| m.remote_port)
+        .filter(|p| !mine.contains(p))
+        .collect()
+}
+
 impl Aliases {
     fn apply(&mut self, dir: &[Mapping]) {
-        let want: HashSet<u16> = dir
-            .iter()
-            .filter(|m| m.online && m.proto == ServiceType::Tcp && m.user != self.me)
-            .map(|m| m.remote_port)
-            .collect();
+        // `alias_bind = ""` turns aliases off
+        let want = if self.bind_host.is_empty() {
+            HashSet::new()
+        } else {
+            alias_ports(dir, &self.me)
+        };
 
         self.tasks.retain(|port, h| {
             if want.contains(port) {
@@ -501,7 +518,18 @@ impl Drop for Aliases {
 async fn run_alias(bind: String, target: String) {
     // Keep retrying: the port may be briefly held by a previous alias (reload)
     // or by another process. This task is aborted when the mapping goes offline.
+    let mut busy_warned = false;
     let l = loop {
+        // A bind to a specific address succeeds on macOS even when a local
+        // service listens on the wildcard, and then shadows it. Check first.
+        if TcpStream::connect(&bind).await.is_ok() {
+            if !busy_warned {
+                warn!("Alias {} not opened: something already listens there", bind);
+                busy_warned = true;
+            }
+            time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
         match TcpListener::bind(&bind).await {
             Ok(l) => break l,
             Err(e) => {
@@ -793,6 +821,27 @@ impl ControlChannelHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_alias_ports() {
+        let m = |user: &str, local_port, remote_port| Mapping {
+            user: user.into(),
+            proto: ServiceType::Tcp,
+            local_port,
+            remote_port,
+            online: true,
+        };
+        // feng's remote 5173 collides with coca's own local 5173: no alias
+        let dir = [
+            m("coca", 5173, 8100),
+            m("feng", 5173, 5173),
+            m("feng", 5174, 5174),
+        ];
+        let want = alias_ports(&dir, "coca");
+        assert!(!want.contains(&5173));
+        assert!(want.contains(&5174));
+        assert!(!want.contains(&8100));
+    }
 
     #[test]
     fn test_render_directory() {

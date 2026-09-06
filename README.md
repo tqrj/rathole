@@ -105,7 +105,7 @@ bob          tcp    3000   21000 online        127.0.0.1:21000       3000-bob.ex
 
 - `LOCAL` / `REMOTE`: the local port on the user's machine and the port the server exposes it on. A local port whose number lies inside the user's `port_block` keeps its number; otherwise the lowest free port of the block is taken. Allocations are persisted in `alloc_file`.
 - `STATUS`: `online`, `offline`, `disabled` (turned off from the desktop app) or `not listening` (own port with nothing bound locally).
-- `ALIAS`: for other users' online TCP mappings the client opens `<alias_bind>:<remote_port>` on this machine and forwards it to the server, so their service is reachable as if it were local.
+- `ALIAS`: for other users' online TCP mappings the client opens `<alias_bind>:<remote_port>` on this machine and forwards it to the server, so their service is reachable as if it were local. No alias is opened for a port that is one of your own exposed local ports or that something already listens on. `alias_bind = ""` turns aliases off; they cannot work anyway when the server sets `expose_bind = "127.0.0.1"` for nginx.
 - `DOMAIN`: shown when the server has `[server.nginx]`; the host name nginx maps to the remote port.
 
 Only ports that are reachable are listed: own TCP ports are probed every few seconds and hidden while nothing listens on them; other users' offline mappings are hidden too. Without a config path `rathole` reads `client.toml` from the current directory.

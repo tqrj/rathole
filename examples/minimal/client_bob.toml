@@ -4,4 +4,4 @@
 remote_addr = "localhost:2333"
 user = "bob"
 key = "bob_secret"
-alias_bind = "127.0.0.1" # Optional. Default: "127.0.0.1"
+alias_bind = "127.0.0.1" # Optional. Default: "127.0.0.1". "" disables aliases

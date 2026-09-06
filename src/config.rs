@@ -195,7 +195,8 @@ pub struct ClientConfig {
     pub remote_addr: String,
     pub user: String,
     pub key: MaskedString,
-    /// Host on which alias listeners (`<alias_bind>:<remote_port>`) are opened
+    /// Host on which alias listeners (`<alias_bind>:<remote_port>`) are opened.
+    /// `""` disables aliases (e.g. when the server only exposes ports to nginx)
     #[serde(default = "default_alias_bind")]
     pub alias_bind: String,
     #[serde(default)]
