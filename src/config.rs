@@ -233,10 +233,25 @@ fn default_alloc_file() -> PathBuf {
     PathBuf::from("allocations.toml")
 }
 
+/// Generate an nginx `map` file from the directory:
+/// `<local_port>.<user>.<domain> <remote_port>;` per TCP mapping
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct NginxConfig {
+    /// Relative to the config file
+    pub map_file: PathBuf,
+    pub domain: String,
+    /// Shell command run after the file changed, e.g. "nginx -s reload"
+    pub reload_cmd: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
+    /// Host the allocated remote ports listen on. Default: host of `bind_addr`
+    pub expose_bind: Option<String>,
+    pub nginx: Option<NginxConfig>,
     /// `[server.users.<name>]`
     #[serde(default)]
     pub users: HashMap<String, UserConfig>,
@@ -254,6 +269,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: Default::default(),
+            expose_bind: None,
+            nginx: None,
             users: Default::default(),
             alloc_file: default_alloc_file(),
             nodelay: None,
@@ -393,10 +410,13 @@ impl Config {
         let mut config = Config::from_str(&s).with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
         })?;
-        // `alloc_file` is relative to the config file
+        // Server-side file paths are relative to the config file
         if let (Some(server), Some(dir)) = (config.server.as_mut(), path.parent()) {
-            if server.alloc_file.is_relative() {
-                server.alloc_file = dir.join(&server.alloc_file);
+            let nginx_map = server.nginx.as_mut().map(|n| &mut n.map_file);
+            for p in std::iter::once(&mut server.alloc_file).chain(nginx_map) {
+                if p.is_relative() {
+                    *p = dir.join(&*p);
+                }
             }
         }
         Ok(config)

@@ -74,21 +74,23 @@ impl Registry {
         wanted.sort_unstable();
         wanted.dedup();
 
+        // Work on a copy so a failed persist (or an exhausted block) leaves
+        // the in-memory table untouched and the next attempt retries the write
+        let mut allocs = self.allocs.clone();
         let mut changed = false;
         for (proto, local_port) in &wanted {
-            let existing = self.allocs.iter().position(|a| {
+            let existing = allocs.iter().position(|a| {
                 a.user == user.name && a.proto == *proto && a.local_port == *local_port
             });
             if let Some(i) = existing {
-                let rp = self.allocs[i].remote_port;
+                let rp = allocs[i].remote_port;
                 if (lo..=hi).contains(&rp) {
                     continue;
                 }
                 // Stale allocation outside the current block
-                self.allocs.remove(i);
+                allocs.remove(i);
             }
-            let used: Vec<u16> = self
-                .allocs
+            let used: Vec<u16> = allocs
                 .iter()
                 .filter(|a| a.user == user.name)
                 .map(|a| a.remote_port)
@@ -102,7 +104,7 @@ impl Registry {
                     user.name
                 ),
             };
-            self.allocs.push(Alloc {
+            allocs.push(Alloc {
                 user: user.name.clone(),
                 proto: *proto,
                 local_port: *local_port,
@@ -111,7 +113,8 @@ impl Registry {
             changed = true;
         }
         if changed {
-            self.persist()?;
+            Self::persist(&self.path, &allocs)?;
+            self.allocs = allocs;
         }
 
         self.online.insert(user.name.clone(), (nonce, wanted));
@@ -152,14 +155,15 @@ impl Registry {
     }
 
     fn publish(&self) {
-        let _ = self.dir_tx.send(Arc::new(self.directory()));
+        // send_replace also stores the value when no client is subscribed yet
+        self.dir_tx.send_replace(Arc::new(self.directory()));
     }
 
-    fn persist(&self) -> Result<()> {
+    fn persist(path: &PathBuf, allocs: &[Alloc]) -> Result<()> {
         let s = toml::to_string(&AllocFile {
-            alloc: self.allocs.clone(),
+            alloc: allocs.to_vec(),
         })?;
-        std::fs::write(&self.path, s).with_context(|| format!("Failed to write {:?}", self.path))
+        std::fs::write(path, s).with_context(|| format!("Failed to write {:?}", path))
     }
 }
 
@@ -194,6 +198,9 @@ mod tests {
 
         let mut r = Registry::load(path.clone()).unwrap();
         let m = r.register(&alice(&[8000, 3000], &[]), n1).unwrap();
+        // A subscriber created after the first registration (no receiver was
+        // alive during `publish`) must still see the mappings
+        assert_eq!(r.subscribe().borrow().len(), 2);
         assert_eq!(remote(&m, ServiceType::Tcp, 3000), Some(20000));
         assert_eq!(remote(&m, ServiceType::Tcp, 8000), Some(20001));
         assert!(m.iter().all(|x| x.online));
@@ -233,5 +240,20 @@ mod tests {
         assert_eq!(remote(&m, ServiceType::Tcp, 3000), Some(30000));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_persist_failure_rolls_back() {
+        let dir = std::env::temp_dir().join(format!("rathole_missing_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut r = Registry::load(dir.join("alloc.toml")).unwrap();
+        let alice = user("alice", 20000, 20001, &[3000], &[]);
+        assert!(r.register(&alice, [1u8; 32]).is_err());
+        assert!(r.directory().is_empty());
+        // Once the directory exists the retry persists
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(r.register(&alice, [1u8; 32]).unwrap().len(), 1);
+        assert!(dir.join("alloc.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

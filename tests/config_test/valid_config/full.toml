@@ -22,6 +22,7 @@ remote_public_key = "key_encoded_in_base64" # Optional
 
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Remote ports are bound on the same host
+expose_bind = "127.0.0.1" # Optional. Host the allocated remote ports listen on. Default: host of `bind_addr`
 alloc_file = "allocations.toml" # Optional. Persisted remote port allocations. Default: "allocations.toml", relative to this file
 nodelay = true # Optional. TCP nodelay of data channels. Default: not changed
 heartbeat_interval = 30 # Optional. Default: 30
@@ -43,3 +44,8 @@ key = "alice_secret" # Necessary. Shared secret of the user
 port_block = "20000-20999" # Necessary. Exclusive block of remote ports of this user. Blocks must not overlap
 tcp = ["1081", "8000-8010"] # Optional. Local TCP ports of the client to expose. Each is "port" or "start-end"
 udp = ["1082"] # Optional. Same for UDP
+
+[server.nginx] # Optional. Keep an nginx `map` file in sync with the directory
+map_file = "rathole.map" # Necessary. Relative to this file. Lines: `<local_port>.<user>.<domain> <remote_port>;`
+domain = "example.com" # Necessary. Suffix of the generated host names
+reload_cmd = "nginx -s reload" # Optional. Shell command run after the file changed

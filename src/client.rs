@@ -395,11 +395,15 @@ impl Drop for Aliases {
 
 #[instrument(skip_all, fields(bind, target))]
 async fn run_alias(bind: String, target: String) {
-    let l = match TcpListener::bind(&bind).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!("Failed to open alias {}: {}", bind, e);
-            return;
+    // Keep retrying: the port may be briefly held by a previous alias (reload)
+    // or by another process. This task is aborted when the mapping goes offline.
+    let l = loop {
+        match TcpListener::bind(&bind).await {
+            Ok(l) => break l,
+            Err(e) => {
+                warn!("Failed to open alias {}: {}. Retry in 1s", bind, e);
+                time::sleep(Duration::from_secs(1)).await;
+            }
         }
     };
     info!("Alias {} -> {}", bind, target);
@@ -407,7 +411,12 @@ async fn run_alias(bind: String, target: String) {
     // Dropping the JoinSet (when this task is aborted) aborts in-flight connections
     let mut set = JoinSet::new();
     loop {
-        match l.accept().await {
+        let accepted = tokio::select! {
+            r = l.accept() => r,
+            // Reap finished connections so the set doesn't grow forever
+            Some(_) = set.join_next(), if !set.is_empty() => continue,
+        };
+        match accepted {
             Ok((mut visitor, _)) => {
                 let target = target.clone();
                 set.spawn(async move {

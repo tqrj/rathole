@@ -16,6 +16,7 @@
   - [映射目录与别名](#映射目录与别名)
   - [Configuration](#configuration)
     - [server.users](#serverusers)
+    - [nginx 子域名反代](#nginx-子域名反代)
     - [端口分配规则](#端口分配规则)
     - [热重载](#热重载)
     - [Logging](#logging)
@@ -97,6 +98,7 @@ alice        tcp       22   20000 online   -
 | `examples/dev_ports` | 客户端开放 `5173-5200`，服务端原样映射到 `5173-5200` |
 | `examples/udp` | 暴露 UDP 端口（`udp = [...]`） |
 | `examples/tls` / `examples/noise_nk` | TLS / Noise 加密传输 |
+| `examples/nginx` | 用 nginx 按子域名反代到各映射端口 |
 | `examples/use_proxy` | 客户端经 socks5/http 代理连接服务器 |
 | `examples/systemd` | Linux 上作为后台服务运行 |
 
@@ -161,6 +163,7 @@ tls = true # 为 true 时使用 client.transport.tls 的设置
 
 [server]
 bind_addr = "0.0.0.0:2333"      # 必填。监听客户端连接的地址。分配出去的远端端口也绑定在同一个地址上
+expose_bind = "127.0.0.1"       # 可选。分配出去的远端端口监听的地址。默认与 bind_addr 同一主机
 alloc_file = "allocations.toml" # 可选。远端端口分配表，相对本文件。默认 "allocations.toml"
 nodelay = true                  # 可选。数据通道的 TCP_NODELAY。默认不修改
 heartbeat_interval = 30         # 可选。应用层心跳间隔，0 关闭。默认 30 秒
@@ -170,6 +173,11 @@ key = "alice_secret"        # 必填。客户端用它认证
 port_block = "20000-20999"  # 必填。远端端口块，"端口" 或 "起-止"。各用户的端口块不能重叠
 tcp = ["22", "8000-8010"]   # 可选。要暴露的客户端本地 TCP 端口，每项为 "端口" 或 "起-止"。客户端连接到 127.0.0.1:<端口>
 udp = ["5353"]              # 可选。同上，UDP
+
+[server.nginx] # 可选。自动维护一份 nginx map 文件，见下文「nginx 子域名反代」
+map_file = "rathole.map"       # 必填。相对本文件
+domain = "example.com"         # 必填。生成的域名后缀
+reload_cmd = "nginx -s reload" # 可选。文件变化后执行的命令
 
 [server.transport] # 同 [client.transport]
 type = "tcp"
@@ -207,6 +215,21 @@ port_block = "21000-21999"
 ```
 
 暴露的端口数不能超过端口块大小，否则配置校验失败。
+
+### nginx 子域名反代
+
+配置 `[server.nginx]` 后，服务端会在映射目录变化时重写 `map_file`，每个 TCP 映射一行：
+
+```
+80.alice.example.com 20000;
+8000.alice.example.com 20001;
+```
+
+nginx 把它 `include` 进一个 `map $host $rathole_port` 块，再用 `proxy_pass http://127.0.0.1:$rathole_port` 反代，泛域名 `*.example.com` 解析到服务器即可通过 `https://80.alice.example.com` 访问 alice 本机的 80 端口。完整片段见 `examples/nginx/nginx.conf`。
+
+配合 `expose_bind = "127.0.0.1"` 可以让映射端口只在本机监听，外部流量必须经过 nginx。代价是其他客户端的别名功能无法再直连这些端口，因为别名转发的目标就是 `服务器:<远端端口>`。
+
+只对 HTTP / WebSocket 有效；ssh 等原始 TCP 没有 Host 头，仍需按端口直连。
 
 ### 端口分配规则
 

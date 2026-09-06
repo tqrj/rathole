@@ -1,4 +1,4 @@
-use crate::config::{Config, ServerConfig, ServiceType, TransportType, UserConfig};
+use crate::config::{Config, NginxConfig, ServerConfig, ServiceType, TransportType, UserConfig};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::{host_port_pair, retry_notify_with_deadline};
 use crate::multi_map::MultiMap;
@@ -15,7 +15,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -140,6 +140,12 @@ impl<T: 'static + Transport> Server<T> {
             .with_context(|| "Failed to listen at `server.bind_addr`")?;
         info!("Listening at {}", self.config.bind_addr);
 
+        // Keep the nginx map in sync with the directory
+        let nginx_task = self.config.nginx.clone().map(|cfg| {
+            let rx = self.registry.lock().unwrap().subscribe();
+            tokio::spawn(run_nginx_map(cfg, rx))
+        });
+
         // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_millis(100),
@@ -208,10 +214,73 @@ impl<T: 'static + Transport> Server<T> {
             }
         }
 
+        if let Some(t) = nginx_task {
+            t.abort();
+        }
+
         info!("Shutdown");
 
         Ok(())
     }
+}
+
+/// Rewrite `cfg.map_file` (and run `reload_cmd`) whenever the TCP mappings change
+async fn run_nginx_map(cfg: NginxConfig, mut rx: DirectoryRx) {
+    loop {
+        let dir = rx.borrow_and_update().clone();
+        if let Err(e) = update_nginx_map(&cfg, &dir).await {
+            error!("{:#}", e);
+        }
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn render_nginx_map(dir: &[Mapping], domain: &str) -> String {
+    dir.iter()
+        .filter(|m| m.proto == ServiceType::Tcp)
+        .map(|m| {
+            format!(
+                "{}.{}.{} {};\n",
+                m.local_port, m.user, domain, m.remote_port
+            )
+        })
+        .collect()
+}
+
+async fn update_nginx_map(cfg: &NginxConfig, dir: &[Mapping]) -> Result<()> {
+    let s = render_nginx_map(dir, &cfg.domain);
+    if tokio::fs::read_to_string(&cfg.map_file)
+        .await
+        .ok()
+        .as_deref()
+        == Some(s.as_str())
+    {
+        return Ok(());
+    }
+    tokio::fs::write(&cfg.map_file, &s)
+        .await
+        .with_context(|| format!("Failed to write {:?}", cfg.map_file))?;
+    info!("Wrote nginx map {:?}", cfg.map_file);
+    if let Some(cmd) = &cfg.reload_cmd {
+        let (sh, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let status = tokio::process::Command::new(sh)
+            .arg(flag)
+            .arg(cmd)
+            .status()
+            .await
+            .with_context(|| format!("Failed to run `{}`", cmd))?;
+        if !status.success() {
+            bail!("`{}` exited with {}", cmd, status);
+        }
+        info!("Ran `{}`", cmd);
+    }
+    Ok(())
 }
 
 // Handle connections to `server.bind_addr`
@@ -333,13 +402,16 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     }
     info!(user = %user.name, "Control channel established");
 
-    let (bind_host, _) = host_port_pair(&server_config.bind_addr)?;
+    let bind_host = match &server_config.expose_bind {
+        Some(h) => h.clone(),
+        None => host_port_pair(&server_config.bind_addr)?.0.to_owned(),
+    };
     let handle = ControlChannelHandle::new(
         conn,
         user.name.clone(),
         session_key,
         mappings,
-        bind_host.to_owned(),
+        bind_host,
         server_config.nodelay,
         server_config.heartbeat_interval,
         registry,
@@ -498,7 +570,9 @@ where
             user,
             nonce,
             registry,
-            control_channels,
+            // Weak: a strong reference would keep the map (and thus our own
+            // shutdown sender) alive after the Server is dropped on reload
+            control_channels: Arc::downgrade(&control_channels),
         };
 
         // Run the control channel
@@ -530,7 +604,7 @@ struct ControlChannel<T: Transport> {
     user: String,
     nonce: Nonce,
     registry: SharedRegistry,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    control_channels: Weak<RwLock<ControlChannelMap<T>>>,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -594,7 +668,9 @@ impl<T: Transport> ControlChannel<T> {
         }
 
         // Remove ourselves (only this session, keyed by nonce) so the listeners close
-        let _ = self.control_channels.write().await.remove2(&self.nonce);
+        if let Some(m) = self.control_channels.upgrade() {
+            let _ = m.write().await.remove2(&self.nonce);
+        }
         self.registry
             .lock()
             .unwrap()
@@ -769,4 +845,29 @@ async fn run_udp_connection_pool<T: Transport>(
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_nginx_map() {
+        let m = |proto, local_port, remote_port| Mapping {
+            user: "alice".into(),
+            proto,
+            local_port,
+            remote_port,
+            online: false,
+        };
+        let dir = [
+            m(ServiceType::Tcp, 80, 20000),
+            m(ServiceType::Udp, 53, 20001),
+            m(ServiceType::Tcp, 8000, 20002),
+        ];
+        assert_eq!(
+            render_nginx_map(&dir, "example.com"),
+            "80.alice.example.com 20000;\n8000.alice.example.com 20002;\n"
+        );
+    }
 }
