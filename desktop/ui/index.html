@@ -129,6 +129,7 @@ $('save').addEventListener('click', async () => {
 (async () => {
   await listen('state', ev => { state = ev.payload; render(); });
   state = await invoke('get_state'); render();
+  $('cfgpath').textContent = await invoke('config_path');
   try { $('cfg').value = await invoke('read_config'); } catch (e) { $('msg').className = 'err'; $('msg').textContent = String(e); }
 })();
 </script>

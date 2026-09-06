@@ -116,7 +116,7 @@ Only ports that are reachable are listed: own TCP ports are probed every few sec
 
 ```sh
 cd desktop
-cargo run -- path/to/client.toml     # defaults to ./client.toml, written with a template if missing
+cargo run -- path/to/client.toml     # default: ./client.toml if present, else the per-user app config dir (shown in the UI)
 npx @tauri-apps/cli@^2 build         # installers in desktop/target/release/bundle
 ```
 

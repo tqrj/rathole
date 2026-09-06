@@ -25,6 +25,11 @@ fn set_port(port: u16, enabled: bool) {
 }
 
 #[tauri::command]
+fn config_path(path: State<ConfigPath>) -> String {
+    path.0.display().to_string()
+}
+
+#[tauri::command]
 fn read_config(path: State<ConfigPath>) -> Result<String, String> {
     std::fs::read_to_string(&path.0).map_err(|e| e.to_string())
 }
@@ -35,6 +40,26 @@ fn save_config(path: State<ConfigPath>, text: String) -> Result<(), String> {
     std::fs::write(&path.0, text).map_err(|e| e.to_string())
 }
 
+/// `rathole-desktop [client.toml]`. Without an argument: `./client.toml` if it
+/// exists (started from a terminal), else the per-user app config dir. An app
+/// bundle started from Finder/Explorer has an arbitrary, often read-only, cwd.
+fn resolve_config_path(app: &tauri::AppHandle) -> PathBuf {
+    if let Some(p) = std::env::args().nth(1) {
+        return PathBuf::from(p);
+    }
+    let cwd = PathBuf::from("client.toml");
+    if cwd.exists() {
+        return cwd;
+    }
+    match app.path().app_config_dir() {
+        Ok(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("client.toml")
+        }
+        Err(_) => cwd,
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -43,20 +68,16 @@ fn main() {
         )
         .init();
 
-    // `rathole-desktop [client.toml]`; default: `client.toml` in the current directory
-    let path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("client.toml"));
-    if !path.exists() {
-        if let Err(e) = std::fs::write(&path, TEMPLATE) {
-            eprintln!("Failed to write {:?}: {}", path, e);
-        }
-    }
-
     tauri::Builder::default()
-        .manage(ConfigPath(path.clone()))
         .setup(move |app| {
+            let path = resolve_config_path(app.handle());
+            if !path.exists() {
+                if let Err(e) = std::fs::write(&path, TEMPLATE) {
+                    eprintln!("Failed to write {:?}: {}", path, e);
+                }
+            }
+            app.manage(ConfigPath(path.clone()));
+
             // The client runs for the lifetime of the app; the sender is kept in
             // the app state so the shutdown channel stays open
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -89,6 +110,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             set_port,
+            config_path,
             read_config,
             save_config
         ])
