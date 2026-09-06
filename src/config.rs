@@ -234,7 +234,7 @@ fn default_alloc_file() -> PathBuf {
 }
 
 /// Generate an nginx `map` file from the directory:
-/// `<local_port>.<user>.<domain> <remote_port>;` per TCP mapping
+/// `<local_port>-<user>.<domain> <remote_port>;` per TCP mapping (one label, so a single-level wildcard certificate covers it)
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NginxConfig {

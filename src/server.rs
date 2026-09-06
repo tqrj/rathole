@@ -242,7 +242,7 @@ fn render_nginx_map(dir: &[Mapping], domain: &str) -> String {
         .filter(|m| m.proto == ServiceType::Tcp)
         .map(|m| {
             format!(
-                "{}.{}.{} {};\n",
+                "{}-{}.{} {};\n",
                 m.local_port, m.user, domain, m.remote_port
             )
         })
@@ -867,7 +867,7 @@ mod tests {
         ];
         assert_eq!(
             render_nginx_map(&dir, "example.com"),
-            "80.alice.example.com 20000;\n8000.alice.example.com 20002;\n"
+            "80-alice.example.com 20000;\n8000-alice.example.com 20002;\n"
         );
     }
 }

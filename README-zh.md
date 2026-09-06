@@ -221,15 +221,17 @@ port_block = "21000-21999"
 配置 `[server.nginx]` 后，服务端会在映射目录变化时重写 `map_file`，每个 TCP 映射一行：
 
 ```
-80.alice.example.com 20000;
-8000.alice.example.com 20001;
+80-alice.example.com 20000;
+8000-alice.example.com 20001;
 ```
 
-nginx 把它 `include` 进一个 `map $host $rathole_port` 块，再用 `proxy_pass http://127.0.0.1:$rathole_port` 反代，泛域名 `*.example.com` 解析到服务器即可通过 `https://80.alice.example.com` 访问 alice 本机的 80 端口。完整片段见 `examples/nginx/nginx.conf`。
+nginx 把它 `include` 进一个 `map $host $rathole_port` 块，再用 `proxy_pass http://127.0.0.1:$rathole_port` 反代，泛域名 `*.example.com` 解析到服务器即可通过 `https://80-alice.example.com` 访问 alice 本机的 80 端口。完整片段见 `examples/nginx/nginx.conf`。
 
 配合 `expose_bind = "127.0.0.1"` 可以让映射端口只在本机监听，外部流量必须经过 nginx。代价是其他客户端的别名功能无法再直连这些端口，因为别名转发的目标就是 `服务器:<远端端口>`。
 
 只对 HTTP / WebSocket 有效；ssh 等原始 TCP 没有 Host 头，仍需按端口直连。
+
+域名只占一级（`80-alice`），是为了落在 `*.example.com` 这类单级泛域名证书的覆盖范围内；Cloudflare 免费的 Universal SSL 不覆盖 `80.alice.example.com` 这种两级子域名。
 
 ### 端口分配规则
 

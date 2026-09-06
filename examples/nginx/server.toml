@@ -1,14 +1,14 @@
-# 用 nginx 按子域名反代：<本地端口>.<用户>.<domain> -> 127.0.0.1:<远端端口>
+# 用 nginx 按子域名反代：<本地端口>-<用户>.<domain> -> 127.0.0.1:<远端端口>
 [server]
 bind_addr = "0.0.0.0:2333"
 expose_bind = "127.0.0.1" # 映射端口只监听本机，外部流量必须经过 nginx。注意：这会让其他客户端的别名无法直连这些端口
 
 [server.nginx]
-map_file = "rathole.map"       # 相对本文件。目录变化时自动重写，内容形如 `80.alice.example.com 20000;`
+map_file = "rathole.map"       # 相对本文件。目录变化时自动重写，内容形如 `80-alice.example.com 20000;`
 domain = "example.com"         # 需要 *.example.com 泛解析到本机
 reload_cmd = "nginx -s reload" # 可选。文件内容变化后执行
 
 [server.users.alice]
 key = "alice_secret"
 port_block = "20000-20999"
-tcp = ["80", "8000"] # 访问 https://80.alice.example.com 和 https://8000.alice.example.com
+tcp = ["80", "8000"] # 访问 https://80-alice.example.com 和 https://8000-alice.example.com

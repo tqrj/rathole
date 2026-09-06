@@ -46,6 +46,6 @@ tcp = ["1081", "8000-8010"] # Optional. Local TCP ports of the client to expose.
 udp = ["1082"] # Optional. Same for UDP
 
 [server.nginx] # Optional. Keep an nginx `map` file in sync with the directory
-map_file = "rathole.map" # Necessary. Relative to this file. Lines: `<local_port>.<user>.<domain> <remote_port>;`
+map_file = "rathole.map" # Necessary. Relative to this file. Lines: `<local_port>-<user>.<domain> <remote_port>;`
 domain = "example.com" # Necessary. Suffix of the generated host names
 reload_cmd = "nginx -s reload" # Optional. Shell command run after the file changed
