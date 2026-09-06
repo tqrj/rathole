@@ -6,7 +6,7 @@ expose_bind = "127.0.0.1" # 映射端口只监听本机，外部流量必须经�
 [server.nginx]
 map_file = "rathole.map"       # 相对本文件。目录变化时自动重写，内容形如 `80-alice.example.com 20000;`
 domain = "example.com"         # 需要 *.example.com 泛解析到本机
-reload_cmd = "nginx -s reload" # 可选。文件内容变化后执行
+reload_cmd = "nginx -s reload" # 文件内容变化后执行。不配的话 nginx 不会重新读 map，映射变化后会 502/404
 
 [server.users.alice]
 key = "alice_secret"

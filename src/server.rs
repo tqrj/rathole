@@ -258,7 +258,11 @@ async fn update_nginx_map(cfg: &NginxConfig, dir: &[Mapping]) -> Result<()> {
         .await
         .with_context(|| format!("Failed to write {:?}", cfg.map_file))?;
     info!("Wrote nginx map {:?}", cfg.map_file);
-    if let Some(cmd) = &cfg.reload_cmd {
+    let reload_cmd = cfg.reload_cmd.as_deref().filter(|c| !c.trim().is_empty());
+    if reload_cmd.is_none() {
+        warn!("nginx map changed but `reload_cmd` is not set: nginx keeps the old map until it is reloaded");
+    }
+    if let Some(cmd) = reload_cmd {
         let (sh, flag) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
