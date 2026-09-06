@@ -1,10 +1,10 @@
 name: Rust
 
+# 推送分支不自动构建；只在 PR 或手动触发时运行。发布构建见 release.yml（tag 自动触发）
 on:
   pull_request:
     branches: ["*"]
-  push:
-    branches: ["main", "dev"]
+  workflow_dispatch:
 
 concurrency:
   # Documentation suggests ${{ github.head_ref }}, but that's only available on pull_request/pull_request_target triggers, so using ${{ github.ref }}.
