@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>"]
 description = "A reverse proxy for NAT traversal"
@@ -18,7 +18,12 @@ default = [
     "noise",
     "websocket-native-tls",
     "hot-reload",
+    "git-version",
 ]
+
+# Embed the git commit in `--version` (pulls libgit2 into the build script;
+# the desktop app turns it off because libgit2-sys fails to link on Windows there)
+git-version = ["vergen/git"]
 
 # Run as a server
 server = []
@@ -132,7 +137,6 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [build-dependencies]
 vergen = { version = "7.4.2", default-features = false, features = [
     "build",
-    "git",
     "cargo",
 ] }
 anyhow = "1.0"

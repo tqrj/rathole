@@ -56,6 +56,7 @@ Almost every module is feature-gated, so a change must compile across combinatio
 | `hot-reload` | Enables the `notify` file watcher for the config file; without it `config_watcher::watch_file` returns a receiver that never fires. |
 | `embedded` | `server,client,hot-reload,noise` (no TLS; cross-compiling TLS is painful). |
 | `console` | tokio-console instrumentation, debug only. |
+| `git-version` | Default. Embeds the git commit in `--version` via vergen's `git` feature. `desktop/` leaves it off: `libgit2-sys` fails to link on Windows there. |
 
 Code paths for missing features call `helper::feature_not_compile()`, which panics at runtime with a "re-compile rathole" message.
 
