@@ -56,3 +56,44 @@ jobs:
         with:
           files: target/${{ matrix.target }}/release/rathole-${{ matrix.target }}.zip
           generate_release_notes: true
+
+  desktop:
+    name: Desktop ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Install Tauri system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev pkg-config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build bundles
+        working-directory: desktop
+        run: npx --yes @tauri-apps/cli@^2 build
+      - name: Collect bundles
+        shell: bash
+        run: |
+          mkdir -p dist
+          find desktop/target/release/bundle \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} dist/ \;
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rathole-desktop-${{ matrix.os }}
+          path: dist/*
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

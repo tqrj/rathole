@@ -1,0 +1,5 @@
+# Written by the rathole desktop app. Edit and save from the UI.
+[client]
+remote_addr = "myserver.com:2333"
+user = "alice"
+key = "alice_secret"
