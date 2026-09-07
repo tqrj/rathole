@@ -65,7 +65,8 @@ pub enum RegisterAck {
 /// The only client -> server frame after registration
 #[derive(Deserialize, Serialize, Debug)]
 pub enum ClientCmd {
-    /// Local ports the client stopped exposing; the server marks them offline
+    /// Local ports the client stopped exposing (turned off, or nothing listens
+    /// on them); the server marks them offline
     Disabled(Vec<u16>),
 }
 

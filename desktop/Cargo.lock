@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "rathole"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-http-proxy",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "rathole-desktop"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "rathole",
  "serde",

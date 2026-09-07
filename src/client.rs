@@ -16,7 +16,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
@@ -384,13 +384,44 @@ fn row_status(m: &Mapping, st: &ClientState) -> &'static str {
     }
     if st.disabled.contains(&m.local_port) {
         "disabled"
+    } else if m.proto == ServiceType::Tcp && !st.listening.contains(&m.local_port) {
+        // Checked before `online`: the server marks these offline once reported
+        "not listening"
     } else if !m.online {
         "offline"
-    } else if m.proto == ServiceType::Tcp && !st.listening.contains(&m.local_port) {
-        "not listening"
     } else {
         "online"
     }
+}
+
+/// Own local ports reported to the server as unavailable: turned off, or TCP
+/// ports nothing listens on. The server marks them offline for everyone.
+fn unavailable_ports(st: &ClientState) -> Vec<u16> {
+    let mut v = st.disabled.clone();
+    for m in &st.directory {
+        if m.user == st.user
+            && m.proto == ServiceType::Tcp
+            && !st.listening.contains(&m.local_port)
+            && !v.contains(&m.local_port)
+        {
+            v.push(m.local_port);
+        }
+    }
+    v.sort_unstable();
+    v
+}
+
+/// Send `unavailable_ports` to the server when it differs from what was last sent
+async fn report_unavailable<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    reported: &mut Vec<u16>,
+) -> Result<()> {
+    let want = unavailable_ports(&STATE.borrow());
+    if want != *reported {
+        write_frame(wr, &ClientCmd::Disabled(want.clone())).await?;
+        *reported = want;
+    }
+    Ok(())
 }
 
 /// Render the directory as a table. Without `show_all` only ports that are
@@ -406,12 +437,13 @@ pub fn render_directory(st: &ClientState, show_all: bool) -> String {
         "ALIAS",
         if st.domain.is_some() { " DOMAIN" } else { "" }
     );
+    let aliased = alias_ports(&st.directory, &st.user);
     for m in &st.directory {
         let status = row_status(m, st);
         if !show_all && status != "online" && status != "disabled" {
             continue;
         }
-        let alias = if m.online && m.proto == ServiceType::Tcp && m.user != st.user {
+        let alias = if m.user != st.user && aliased.contains(&m.remote_port) {
             format!("{}:{}", st.alias_bind, m.remote_port)
         } else {
             String::from("-")
@@ -675,12 +707,11 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         let (mut rd, mut wr) = io::split(conn);
 
-        // Tell the server which ports are turned off, now and on every change
+        // Tell the server which ports are unavailable, now and on every change
         let mut disabled_rx = DISABLED.subscribe();
-        let disabled = disabled_rx.borrow_and_update().clone();
-        if !disabled.is_empty() {
-            write_frame(&mut wr, &ClientCmd::Disabled(disabled)).await?;
-        }
+        disabled_rx.borrow_and_update();
+        let mut reported = Vec::new();
+        report_unavailable(&mut wr, &mut reported).await?;
 
         // Frames from the server are read by a task: `read_frame` is not
         // cancel-safe, so it can't sit in the `select!` below
@@ -721,6 +752,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
                             aliases.apply(&dir);
                             update_state(|st| { st.directory = dir; st.listening = listening; });
                             println!("{}", render_directory(&STATE.borrow(), false));
+                            if let Err(e) = report_unavailable(&mut wr, &mut reported).await {
+                                break Err(e);
+                            }
                         }
                     }
                 },
@@ -730,14 +764,17 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     if listening != STATE.borrow().listening {
                         update_state(|st| st.listening = listening);
                         println!("{}", render_directory(&STATE.borrow(), false));
+                        if let Err(e) = report_unavailable(&mut wr, &mut reported).await {
+                            break Err(e);
+                        }
                     }
                 },
                 Ok(()) = disabled_rx.changed() => {
                     let disabled = disabled_rx.borrow_and_update().clone();
-                    if let Err(e) = write_frame(&mut wr, &ClientCmd::Disabled(disabled.clone())).await {
+                    update_state(|st| st.disabled = disabled);
+                    if let Err(e) = report_unavailable(&mut wr, &mut reported).await {
                         break Err(e);
                     }
-                    update_state(|st| st.disabled = disabled);
                 },
                 _ = time::sleep(Duration::from_secs(self.config.heartbeat_timeout)), if self.config.heartbeat_timeout != 0 => {
                     break Err(anyhow!("Heartbeat timed out"));
@@ -875,5 +912,7 @@ mod tests {
         assert!(!out.contains("20001") && !out.contains("21001"));
         let all = render_directory(&st, true);
         assert!(all.contains("not listening") && all.contains("21001"));
+        // 81 is not listening, 82 is disabled; other users' ports never
+        assert_eq!(unavailable_ports(&st), vec![81, 82]);
     }
 }
